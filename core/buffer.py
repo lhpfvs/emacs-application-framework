@@ -282,8 +282,9 @@ class Buffer(QGraphicsScene):
         pass
 
     @abstract
-    def resize_view(self):
-        (_, _, width, height) = get_emacs_func_result("eaf-get-window-size-by-buffer-id", [self.buffer_id])
+    def resize_view(self, width=None, height=None):
+        if width is None or height is None:
+            (_, _, width, height) = get_emacs_func_result("eaf-get-window-size-by-buffer-id", [self.buffer_id])
         self.buffer_widget.resize(width, height)
 
     def get_key_event_widgets(self):

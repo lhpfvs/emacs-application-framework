@@ -20,6 +20,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import os
+import platform
 
 import sexpdata
 from PyQt6 import QtGui
@@ -33,6 +34,9 @@ class PostGui(QObject):
 
     def __init__(self, inclass=True):
         super(PostGui, self).__init__()
+        app = QApplication.instance()
+        if app is not None and self.thread() != app.thread():
+            self.moveToThread(app.thread())
         self.through_thread.connect(self.on_signal_received)
         self.inclass = inclass
 
@@ -98,16 +102,28 @@ def string_to_base64(text):
     return str(base64.b64encode(str(text).encode("utf-8")), "utf-8")
 
 def get_local_ip():
-    try:
-        import socket
+    import socket
 
+    try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         return s.getsockname()[0]
     except OSError:
-        import sys
-        print("Network is unreachable")
-        sys.exit()
+        pass
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+    try:
+        hostname_ip = socket.gethostbyname(socket.gethostname())
+        if hostname_ip and hostname_ip != "127.0.0.1":
+            return hostname_ip
+    except OSError:
+        pass
+
+    return "127.0.0.1"
 
 def popen_and_call(popen_args, on_exit):
     """
@@ -247,6 +263,42 @@ def close_epc_client():
     if epc_client is not None:
         epc_client.close()
 
+# ─── embedded-mode bridge (_eaf_bridge) ───────────────────────────────────────
+#
+# When running in-process (macOS dynamic module), _eaf_bridge is a built-in
+# C extension registered via PyImport_AppendInittab before Py_Initialize().
+# All Python→Emacs calls route through it instead of EPC.
+
+def _is_embedded() -> bool:
+    """Return True when running in-process inside the Emacs dynamic module."""
+    try:
+        import _eaf_bridge
+        return bool(_eaf_bridge.is_embedded())
+    except ImportError:
+        return False
+
+def _bridge_val(val):
+    """Convert a sexpdata-parsed value to the Python equivalent EPC would return."""
+    if isinstance(val, sexpdata.Symbol):
+        name = str(val)
+        if name == 't':
+            return True
+        elif name == 'nil':
+            return []   # EPC convention: nil → empty list (falsy)
+        return name
+    if isinstance(val, list) and len(val) == 0:
+        return []       # sexpdata maps nil → []
+    return val
+
+def _bridge_parse(raw: str):
+    """Parse a prin1 string from the bridge into a Python value."""
+    try:
+        parsed = sexpdata.loads(raw)
+    except Exception:
+        return raw
+    return _bridge_val(parsed)
+
+# ──────────────────────────────────────────────────────────────────────────────
 
 def handle_arg_types(arg):
     if isinstance(arg, str) and arg.startswith("'"):
@@ -254,11 +306,54 @@ def handle_arg_types(arg):
 
     return sexpdata.Quoted(arg)
 
+def _build_emacs_call_sexp(method_name, args):
+    raw_args = list(args)
+    args = [sexpdata.Symbol(method_name)] + list(map(handle_arg_types, raw_args))    # type: ignore
+    return sexpdata.dumps(args), raw_args
+
+
+def _embedded_emacs_notify(method_name, raw_args, sexp):
+    import _eaf_bridge
+
+    if method_name == "eaf-focus-buffer" and len(raw_args) == 1:
+        _eaf_bridge.focus_buffer(str(raw_args[0]))
+        return None
+    if method_name == "eaf-activate-emacs-window":
+        if platform.system() == "Darwin":
+            # Embedded macOS views already live inside Emacs windows.
+            # Re-raising the app from Qt show/focus callbacks is unnecessary;
+            # just select the matching Emacs window when a buffer id is
+            # available.
+            if len(raw_args) == 1:
+                _eaf_bridge.focus_buffer(str(raw_args[0]))
+            return None
+        if len(raw_args) == 0:
+            _eaf_bridge.activate_emacs_window()
+        elif len(raw_args) == 1:
+            _eaf_bridge.activate_emacs_window(str(raw_args[0]))
+        else:
+            _eaf_bridge.activate_emacs_window()
+        return None
+
+    _eaf_bridge.eval_async(sexp)
+    return None
+
+
+def _embedded_emacs_query(sexp):
+    import _eaf_bridge
+
+    raw = _eaf_bridge.call_sync(sexp)
+    result = _bridge_parse(raw)
+    return result if result != [] else False
+
+
 def eval_in_emacs(method_name, args):
     global epc_client
 
-    args = [sexpdata.Symbol(method_name)] + list(map(handle_arg_types, args))    # type: ignore
-    sexp = sexpdata.dumps(args)
+    sexp, raw_args = _build_emacs_call_sexp(method_name, args)
+
+    if _is_embedded():
+        return _embedded_emacs_notify(method_name, raw_args, sexp)
 
     epc_client.call("eval-in-emacs", [sexp])    # type: ignore
 
@@ -266,8 +361,10 @@ def eval_in_emacs(method_name, args):
 def get_emacs_func_result(method_name, args):
     global epc_client
 
-    args = [sexpdata.Symbol(method_name)] + list(map(handle_arg_types, args))    # type: ignore
-    sexp = sexpdata.dumps(args)
+    sexp, _ = _build_emacs_call_sexp(method_name, args)
+
+    if _is_embedded():
+        return _embedded_emacs_query(sexp)
 
     result = epc_client.call_sync("get-emacs-func-result", [sexp])    # type: ignore
     return result if result != [] else False
@@ -280,12 +377,18 @@ def get_app_dark_mode(app_dark_mode_var):
              get_emacs_theme_mode() == "dark"))
 
 def get_emacs_theme_mode():
+    if _is_embedded():
+        return get_emacs_func_cache_result("eaf-get-theme-mode", [])
     return get_emacs_func_result("eaf-get-theme-mode", [])
 
 def get_emacs_theme_background():
+    if _is_embedded():
+        return get_emacs_func_cache_result("eaf-get-theme-background-color", [])
     return get_emacs_func_result("eaf-get-theme-background-color", [])
 
 def get_emacs_theme_foreground():
+    if _is_embedded():
+        return get_emacs_func_cache_result("eaf-get-theme-foreground-color", [])
     return get_emacs_func_result("eaf-get-theme-foreground-color", [])
 
 def message_to_emacs(message, prefix=True, logging=True):
@@ -295,6 +398,8 @@ def clear_emacs_message():
     eval_in_emacs('eaf--clear-message', [])
 
 def set_emacs_var(var_name, var_value):
+    if _is_embedded():
+        emacs_var_cache_dict[var_name] = var_value
     eval_in_emacs('eaf--set-emacs-var', [var_name, var_value])
 
 def open_url_in_background_tab(url):
@@ -333,14 +438,42 @@ def convert_emacs_bool(symbol_value, symbol_is_boolean):
 def get_emacs_vars(args):
     global epc_client
 
+    if _is_embedded():
+        return [get_emacs_var(name) for name in args]
+
     return list(map(lambda result: convert_emacs_bool(result[0], result[1]) if result != [] else False, epc_client.call_sync("get-emacs-vars", args))) # type: ignore
+
+emacs_var_cache_dict = {}
 
 def get_emacs_var(var_name):
     global epc_client
 
+    if _is_embedded() and var_name in emacs_var_cache_dict:
+        return emacs_var_cache_dict[var_name]
+
+    if _is_embedded():
+        import _eaf_bridge
+        raw = _eaf_bridge.get_var(var_name)
+        # Bridge calls (eaf--get-emacs-var name) which returns (value is-bool-string).
+        # prin1-to-string of that list is what we receive, e.g. '(t "t")' or '("hello" "nil")'.
+        try:
+            parsed = sexpdata.loads(raw)
+        except Exception:
+            return False
+        if isinstance(parsed, list) and len(parsed) == 2:
+            sym_val = _bridge_val(parsed[0])
+            sym_is_bool = parsed[1] if not isinstance(parsed[1], sexpdata.Symbol) else str(parsed[1])
+            result = convert_emacs_bool(sym_val, sym_is_bool)
+            emacs_var_cache_dict[var_name] = result
+            return result
+        result = _bridge_val(parsed)
+        emacs_var_cache_dict[var_name] = result
+        return result
+
     (symbol_value, symbol_is_boolean) = epc_client.call_sync("get-emacs-var", [var_name]) # type: ignore
 
-    return convert_emacs_bool(symbol_value, symbol_is_boolean)
+    result = convert_emacs_bool(symbol_value, symbol_is_boolean)
+    return result
 
 emacs_config_dir = ""
 
@@ -365,12 +498,13 @@ emacs_func_cache_dict = {}
 
 def get_emacs_func_cache_result(func_name, func_args):
     global emacs_func_cache_dict
+    cache_key = (func_name, repr(func_args))
 
-    if func_name in emacs_func_cache_dict:
-        return emacs_func_cache_dict[func_name]
+    if cache_key in emacs_func_cache_dict:
+        return emacs_func_cache_dict[cache_key]
     else:
         result = get_emacs_func_result(func_name, func_args)
-        emacs_func_cache_dict[func_name] = result
+        emacs_func_cache_dict[cache_key] = result
 
         return result
 

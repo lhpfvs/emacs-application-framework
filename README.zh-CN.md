@@ -77,6 +77,12 @@ chmod +x ./install-eaf.py
 
 `install-eaf.py`脚本有许多有用的选项， 可以通过`--help`查看。
 
+在 macOS 上，`install-eaf.py` 现在还会自动安装 `dependencies.json` 里列出的 Homebrew 系统依赖，并自动编译 `core/macos/eaf-macos-module.so` 原生模块。请先确保已经安装 Xcode Command Line Tools，并使用带开发头文件和动态库的 Python；默认推荐 Homebrew 的 `python`。如果你的 Emacs.app 不在 `/Applications/Emacs.app`，可以手动执行：
+
+```Bash
+EMACS_APP=/path/to/Emacs.app make -C core/macos PYTHON="$(command -v python3)"
+```
+
 #### 3. 加载 EAF 核心
 
 从这里开始， 你可以把 EAF 加入 Emacs 的 ```load-path```， 然后在 `init.el` 中写入:

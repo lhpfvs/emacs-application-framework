@@ -121,6 +121,24 @@ handled by it.")
 (defvar eaf-build-dir (file-name-directory (locate-library "eaf")))
 (defvar eaf-source-dir (file-name-directory (file-truename (concat eaf-build-dir "eaf.el"))))
 
+;; macOS: load the NSView embedding dynamic module.
+(when (eq system-type 'darwin)
+  (let ((so (expand-file-name "core/macos/eaf-macos-module.so" eaf-source-dir)))
+    (when (file-exists-p so)
+      (condition-case err
+          (module-load so)
+        (error
+         (message "[EAF] Failed to load macOS native module %s: %s" so (error-message-string err)))))))
+
+(defun eaf--macos-venv-site-packages ()
+  "Return site-packages path of the EAF venv, or empty string if not found."
+  (let ((venv-py (expand-file-name ".venv/bin/python3" eaf-source-dir)))
+    (if (file-executable-p venv-py)
+        (string-trim
+         (shell-command-to-string
+          (concat venv-py " -c \"import sysconfig; print(sysconfig.get_path('purelib'))\"")))
+      "")))
+
 ;; Helper functions for generating the defcustom entry for the list of apps
 (defun eaf--alist-to-defcustom-const (entry)
   "Map an alist for an app to an entry for the defcustom set"
@@ -343,6 +361,7 @@ been initialized."
             (eaf-color-int-to-hex (nth 2 components)))))
 
 (defvar eaf-epc-process nil)
+(defvar eaf-emacs-frame nil)
 
 (defvar eaf-internal-process nil)
 (defvar eaf-internal-process-prog nil)
@@ -350,10 +369,6 @@ been initialized."
 
 (defvar eaf--first-start-app-buffers nil
   "Contains a list of '(buffer-url buffer-app-name buffer-args).")
-
-(defvar eaf-last-frame-width 0)
-
-(defvar eaf-last-frame-height 0)
 
 (defcustom eaf-name "*eaf*"
   "Name of EAF buffer."
@@ -635,14 +650,104 @@ A hashtable, key is url and value is title.")
            (let ((process-connection-type nil))
              (start-process "" nil "xdg-open" path-or-url))))))
 
+(defun eaf--macos-python-arg (arg)
+  "Convert ARG to the string form expected by `eaf-macos-call-python'."
+  (cond ((stringp arg) arg)
+        ((integerp arg) (number-to-string arg))
+        ((floatp arg) (number-to-string arg))
+        ((null arg) "nil")
+        ((symbolp arg) (symbol-name arg))
+        (t (format "%s" arg))))
+
+(defun eaf--macos-call-python (method &rest args)
+  "Call METHOD through the embedded macOS Python bridge."
+  (pcase args
+    (`() (eaf-macos-call-python method))
+    (`(,a)
+     (eaf-macos-call-python method
+                            (eaf--macos-python-arg a)))
+    (`(,a ,b)
+     (eaf-macos-call-python method
+                            (eaf--macos-python-arg a)
+                            (eaf--macos-python-arg b)))
+    (`(,a ,b ,c)
+     (eaf-macos-call-python method
+                            (eaf--macos-python-arg a)
+                            (eaf--macos-python-arg b)
+                            (eaf--macos-python-arg c)))
+    (`(,a ,b ,c ,d)
+     (eaf-macos-call-python method
+                            (eaf--macos-python-arg a)
+                            (eaf--macos-python-arg b)
+                            (eaf--macos-python-arg c)
+                            (eaf--macos-python-arg d)))
+    (_
+     (apply #'eaf-macos-call-python method
+            (mapcar #'eaf--macos-python-arg args)))))
+
+(defun eaf--macos-store-sync-result (token kind payload)
+  "Store embedded macOS sync result for TOKEN.
+KIND is a string tag emitted by Python and PAYLOAD is its serialized value."
+  (puthash token (cons kind payload) eaf--macos-sync-call-results))
+
+(defun eaf--macos-decode-sync-payload (payload)
+  "Decode base64 PAYLOAD from the embedded macOS bridge."
+  (decode-coding-string (base64-decode-string (or payload "")) 'utf-8))
+
+(defun eaf--macos-finish-sync-result (token result)
+  "Decode RESULT for TOKEN and remove it from the result table."
+  (remhash token eaf--macos-sync-call-results)
+  (pcase result
+    (`("nil" . ,_)
+     nil)
+    (`("bool" . "t")
+     t)
+    (`("bool" . ,_)
+     nil)
+    (`("int" . ,payload)
+     (string-to-number payload))
+    (`("string" . ,payload)
+     (eaf--macos-decode-sync-payload payload))
+    (`("error" . ,payload)
+     (error "[EAF] embedded macOS sync call failed: %s"
+            (eaf--macos-decode-sync-payload payload)))
+    (_
+     nil)))
+
+(defun eaf--macos-call-sync-via-bridge (method &rest args)
+  "Call embedded macOS Python METHOD and wait for async bridge result."
+  (let* ((token (eaf--generate-id))
+         (deadline (+ (float-time) eaf--macos-sync-call-timeout))
+         (result :pending))
+    (remhash token eaf--macos-sync-call-results)
+    (apply #'eaf--macos-call-python "dispatch_buffer_return_call" token method args)
+    (while (and (eq result :pending)
+                (< (float-time) deadline))
+      (when (fboundp 'eaf-macos-service-bridge)
+        (eaf-macos-service-bridge))
+      (setq result (gethash token eaf--macos-sync-call-results :pending))
+      (when (eq result :pending)
+        (sleep-for 0.01)))
+    (if (eq result :pending)
+        (progn
+          (remhash token eaf--macos-sync-call-results)
+          (error "[EAF] timed out waiting for embedded macOS sync call: %s" method))
+      (eaf--macos-finish-sync-result token result))))
+
 (defun eaf-call-async (method &rest args)
-  "Call Python EPC function METHOD and ARGS asynchronously."
-  (eaf-deferred-chain
-    (eaf-epc-call-deferred eaf-epc-process (read method) args)))
+  "Call Python METHOD and ARGS asynchronously."
+  (if (eaf--macos-embedded-p)
+      (apply #'eaf--macos-call-python method args)
+    (eaf-deferred-chain
+      (eaf-epc-call-deferred eaf-epc-process (read method) args))))
 
 (defun eaf-call-sync (method &rest args)
-  "Call Python EPC function METHOD and ARGS synchronously."
-  (eaf-epc-call-sync eaf-epc-process (read method) args))
+  "Call Python METHOD and ARGS synchronously."
+  (if (eaf--macos-embedded-p)
+      (if (member method eaf--macos-deferred-sync-methods)
+          (apply #'eaf--macos-call-sync-via-bridge method args)
+        (apply #'eaf--macos-call-python method args))
+    (eaf-epc-call-sync eaf-epc-process (read method) args)))
 
 (defun eaf--called-from-wsl-on-windows-p ()
   "Check whether eaf is called by Emacs on WSL and is running on Windows."
@@ -653,7 +758,8 @@ A hashtable, key is url and value is title.")
   "Get Emacs FRAME xid."
   (if (eaf--called-from-wsl-on-windows-p)
       (eaf-call-sync "get_emacs_wsl_window_id")
-    (frame-parameter frame 'window-id)))
+    (or (frame-parameter frame 'window-id)
+        (frame-parameter frame 'outer-window-id))))
 
 (defun eaf--build-process-environment ()
   ;; Turn on DEBUG info when `eaf-enable-debug' is non-nil.
@@ -695,45 +801,209 @@ A hashtable, key is url and value is title.")
 
 (defvar eaf-start-process-hook nil)
 
+(defun eaf--macos-embedded-p ()
+  "Return non-nil when EAF is running in-process via the macOS dynamic module."
+  (and (eq system-type 'darwin)
+       (fboundp 'eaf-macos-alive-p)
+       (eaf-macos-alive-p)))
+
+(defvar eaf--macos-bridge-service-installed nil
+  "Non-nil when the embedded macOS bridge service hook is installed.")
+
+(defvar eaf--macos-bridge-startup-timer nil
+  "Short-lived timer used to drain the embedded macOS bridge during startup.")
+
+(defvar eaf--macos-sync-call-results (make-hash-table :test #'equal)
+  "Pending embedded macOS sync-call results keyed by token.")
+
+(defconst eaf--macos-deferred-sync-methods
+  '("execute_function" "execute_function_with_args"
+    "execute_js_code" "execute_js_function")
+  "Embedded macOS Python calls that must round-trip through the bridge.")
+
+(defvar eaf--macos-sync-call-timeout 10.0
+  "Seconds to wait for an embedded macOS sync call before timing out.")
+
+(defun eaf--start-process-ready-p ()
+  "Return non-nil when EAF startup helpers have been defined."
+  (and (fboundp 'eaf-get-render-size)
+       (fboundp 'eaf-monitor-window-size-change)
+       (fboundp 'eaf-monitor-configuration-change)))
+
+(defun eaf--schedule-start-process-retry ()
+  "Retry `eaf-start-process' after `eaf.el' finishes loading."
+  (run-with-idle-timer 0.2 nil #'eaf--autoload-start-process-when-ready))
+
+(defun eaf--safe-monitor-window-size-change (frame)
+  "Call `eaf-monitor-window-size-change' once it has been defined."
+  (when (fboundp 'eaf-monitor-window-size-change)
+    (eaf-monitor-window-size-change frame)))
+
+(defun eaf--safe-monitor-configuration-change (&rest args)
+  "Call `eaf-monitor-configuration-change' once it has been defined."
+  (when (fboundp 'eaf-monitor-configuration-change)
+    (apply #'eaf-monitor-configuration-change args)))
+
+(defun eaf--safe-frame-lifecycle-sync (frame)
+  "Refresh EAF geometry after FRAME creation or deletion."
+  (when (fboundp 'eaf--schedule-frame-lifecycle-sync)
+    (eaf--schedule-frame-lifecycle-sync frame)))
+
+(defun eaf--schedule-macos-embedded-view-sync-retries ()
+  "Retry embedded macOS view sync a few times during cold start.
+
+The first EAF buffer after startup can race with window display and native
+view attachment.  A handful of short retries is cheaper than forcing users to
+manually reopen the same buffer several times."
+  (when (eaf--macos-embedded-p)
+    (dolist (delay '(0.03 0.08 0.16 0.3 0.5))
+      (run-with-timer
+       delay nil
+       (lambda ()
+         (when (eaf--macos-embedded-p)
+           (eaf-monitor-configuration-change)))))))
+
+;; Clean out stale direct hooks from older partially-loaded sessions before
+;; reinstalling the wrapper variants below.
+(remove-hook 'window-size-change-functions #'eaf-monitor-window-size-change)
+(remove-hook 'window-configuration-change-hook #'eaf-monitor-configuration-change)
+(remove-hook 'move-frame-functions #'eaf-monitor-configuration-change)
+(remove-hook 'move-frame-functions #'eaf--safe-monitor-configuration-change)
+(remove-hook 'after-make-frame-functions #'eaf--safe-frame-lifecycle-sync)
+(remove-hook 'delete-frame-functions #'eaf--safe-frame-lifecycle-sync)
+
+(defun eaf--service-macos-bridge ()
+  "Drain pending Python→Emacs bridge work in embedded macOS mode.
+
+Embedded ns-port callbacks queue bridge work when Python runs outside the
+immediate Emacs call stack, so we drain that queue from `post-command-hook'."
+  (when (and (eq system-type 'darwin)
+             (fboundp 'eaf-macos-service-bridge))
+    (ignore-errors
+      (eaf-macos-service-bridge))))
+
+(defun eaf--schedule-macos-bridge-startup-retries ()
+  "Drain startup bridge work a few times while embedded EAF is booting.
+
+Cold start can finish on a Python background thread after the initiating Emacs
+command has already returned, so relying on the next `post-command-hook' alone
+can leave `(eaf--first-start-embedded)' queued until the user does something
+else.  A handful of short one-shot retries is enough to service that queue
+without restoring a permanent high-frequency timer."
+  (when (eq system-type 'darwin)
+    (dolist (delay '(0.03 0.08 0.16 0.3 0.5 0.8 1.2 1.8))
+      (run-with-timer
+       delay nil
+       (lambda ()
+         (when (fboundp 'eaf-macos-service-bridge)
+           (ignore-errors
+             (eaf-macos-service-bridge))))))))
+
+(defun eaf--start-macos-bridge-startup-timer ()
+  "Keep draining the embedded macOS bridge until startup finishes."
+  (when (and (eq system-type 'darwin)
+             (null eaf--macos-bridge-startup-timer))
+    (setq eaf--macos-bridge-startup-timer
+          (run-with-timer
+           0.02 0.02
+           (lambda ()
+             (if (or (not (fboundp 'eaf-macos-service-bridge))
+                     (eaf--macos-embedded-p))
+                 (progn
+                   (when (timerp eaf--macos-bridge-startup-timer)
+                     (cancel-timer eaf--macos-bridge-startup-timer))
+                   (setq eaf--macos-bridge-startup-timer nil))
+               (ignore-errors
+                 (eaf-macos-service-bridge))))))))
+
+(defun eaf--enable-macos-bridge-service ()
+  "Enable bridge servicing for embedded macOS EAF."
+  (unless eaf--macos-bridge-service-installed
+    (add-hook 'post-command-hook #'eaf--service-macos-bridge)
+    (setq eaf--macos-bridge-service-installed t)))
+
+(defun eaf--disable-macos-bridge-service ()
+  "Disable bridge servicing for embedded macOS EAF."
+  (when eaf--macos-bridge-service-installed
+    (remove-hook 'post-command-hook #'eaf--service-macos-bridge)
+    (when (timerp eaf--macos-bridge-startup-timer)
+      (cancel-timer eaf--macos-bridge-startup-timer))
+    (setq eaf--macos-bridge-startup-timer nil)
+    (setq eaf--macos-bridge-service-installed nil)))
+
+(defun eaf--first-start-embedded ()
+  "Called by Python via the bridge queue after EAF embedded init completes.
+Opens any buffers that were queued before the Python engine was ready."
+  (when (timerp eaf--macos-bridge-startup-timer)
+    (cancel-timer eaf--macos-bridge-startup-timer))
+  (setq eaf--macos-bridge-startup-timer nil)
+  (setq eaf-emacs-frame (window-frame))
+  (dolist (buffer-info eaf--first-start-app-buffers)
+    (eaf--open-internal (nth 0 buffer-info) (nth 1 buffer-info) (nth 2 buffer-info)))
+  (setq eaf--first-start-app-buffers nil))
+
 (defun eaf-start-process ()
   "Start EAF process if it isn't started."
-  (unless (eaf-epc-live-p eaf-epc-process)
-    ;; start epc server and set `eaf-server-port'
-    (eaf--start-epc-server)
-    (let* ((eaf-args (append
-                      (list eaf-python-file)
-                      (eaf-get-render-size)
-                      (list (number-to-string eaf-server-port))
-                      ))
-           environments)
+  (if (not (eaf--start-process-ready-p))
+      (eaf--schedule-start-process-retry)
+    (unless (or (eaf-epc-live-p eaf-epc-process) (eaf--macos-embedded-p))
+      (if (and (eq system-type 'darwin) (fboundp 'eaf-macos-start-python))
+          ;; macOS: start Python in-process via the NSView dynamic module.
+          ;; No EPC server needed — Python↔Emacs IPC goes through the bridge queue.
+          ;; eaf-macos-start-python(W H SOURCE-DIR VENV-SITE): 4 args, no EPC port.
+          (let* ((size (eaf-get-render-size))
+            (w    (string-to-number (car size)))
+                 (h    (string-to-number (cadr size)))
+                 (site (eaf--macos-venv-site-packages)))
+            (eaf-macos-start-python w h eaf-source-dir site)
+            (eaf--enable-macos-bridge-service)
+            (eaf--start-macos-bridge-startup-timer)
+            (eaf--schedule-macos-bridge-startup-retries))
 
-      ;; Folow system DPI.
-      (setq environments (eaf--build-process-environment))
+        ;; Other platforms: start EPC server then spawn a Python subprocess.
+        (eaf--start-epc-server)
+        (let* ((eaf-args (append
+                          (list eaf-python-file)
+                          (eaf-get-render-size)
+                          (list (number-to-string eaf-server-port))
+                          ))
+               environments)
 
-      ;; Set process arguments.
-      (if eaf-enable-debug
-          (progn
-            (setq eaf-internal-process-prog "gdb")
-            (setq eaf-internal-process-args (append (list "-batch" "-ex" "run" "-ex" "bt" "--args" eaf-python-command) eaf-args)))
-        (setq eaf-internal-process-prog eaf-python-command)
-        (setq eaf-internal-process-args eaf-args))
+          ;; Follow system DPI.
+          (setq environments (eaf--build-process-environment))
 
-      ;; Start python process.
-      (let ((process-connection-type (not (eaf--called-from-wsl-on-windows-p)))
-            (process-environment environments))
-        (setq eaf-internal-process (apply 'start-process eaf-name eaf-name eaf-internal-process-prog eaf-internal-process-args)))
-      (set-process-query-on-exit-flag eaf-internal-process nil)))
+          ;; Set process arguments.
+          (if eaf-enable-debug
+              (progn
+                (setq eaf-internal-process-prog "gdb")
+                (setq eaf-internal-process-args (append (list "-batch" "-ex" "run" "-ex" "bt" "--args" eaf-python-command) eaf-args)))
+            (setq eaf-internal-process-prog eaf-python-command)
+            (setq eaf-internal-process-args eaf-args))
 
-  ;; Run start process hooks.
-  (run-hooks 'eaf-start-process-hook))
+          ;; Start python process.
+          (let ((process-connection-type (not (eaf--called-from-wsl-on-windows-p)))
+                (process-environment environments))
+            (setq eaf-internal-process (apply 'start-process eaf-name eaf-name eaf-internal-process-prog eaf-internal-process-args)))
+          (set-process-query-on-exit-flag eaf-internal-process nil)))
+
+    ;; Run start process hooks only after startup helpers are ready.
+    (run-hooks 'eaf-start-process-hook))))
+
+
+(defun eaf--autoload-start-process-when-ready ()
+  "Start EAF after `eaf.el' has finished defining all required helpers."
+  (if (and (fboundp 'eaf-start-process)
+           (eaf--start-process-ready-p))
+      (when eaf-start-python-process-when-require
+        (eaf-start-process))
+    ;; When `eaf.el' is being evaluated interactively, the idle timer may fire
+    ;; before later helper functions in this file are defined.  Retry shortly
+    ;; instead of signaling `void-function'.
+    (eaf--schedule-start-process-retry)))
 
 (run-with-idle-timer
  1 nil
- #'(lambda ()
-     ;; Start EAF python process when load `eaf'.
-     ;; It will improve start speed.
-     (when eaf-start-python-process-when-require
-       (eaf-start-process))))
+ #'eaf--autoload-start-process-when-ready)
 
 (defvar eaf-stop-process-hook nil)
 
@@ -742,6 +1012,8 @@ A hashtable, key is url and value is title.")
 
 If RESTART is non-nil, cached URL and app-name will not be cleared."
   (interactive)
+
+  (eaf--disable-macos-bridge-service)
 
   ;; Run stop process hooks.
   (run-hooks 'eaf-stop-process-hook)
@@ -754,6 +1026,11 @@ If RESTART is non-nil, cached URL and app-name will not be cleared."
     (remove-hook 'kill-emacs-hook #'eaf--monitor-emacs-kill)
     (remove-hook 'after-save-hook #'eaf--org-preview-monitor-buffer-save)
     (remove-hook 'kill-buffer-hook #'eaf--org-preview-monitor-kill)
+    (remove-hook 'window-size-change-functions #'eaf--safe-monitor-window-size-change)
+    (remove-hook 'window-configuration-change-hook #'eaf--safe-monitor-configuration-change)
+    (remove-hook 'move-frame-functions #'eaf--safe-monitor-configuration-change)
+    (remove-hook 'after-make-frame-functions #'eaf--safe-frame-lifecycle-sync)
+    (remove-hook 'delete-frame-functions #'eaf--safe-frame-lifecycle-sync)
     (remove-hook 'window-size-change-functions #'eaf-monitor-window-size-change)
     (remove-hook 'window-configuration-change-hook #'eaf-monitor-configuration-change))
 
@@ -837,6 +1114,59 @@ We need calcuate render allocation to make sure no black border around render co
          (h (- (nth 3 window-edges) (window-mode-line-height window) y)))
     (list x y w h)))
 
+(defun eaf-get-window-body-allocation (&optional window)
+  "Get WINDOW body allocation using inside pixel edges."
+  (let* ((window-edges (window-inside-pixel-edges window))
+         (x (nth 0 window-edges))
+         (y (nth 1 window-edges))
+         (w (- (nth 2 window-edges) x))
+         (h (- (nth 3 window-edges) y)))
+    (list x y w h)))
+
+(defun eaf--macos-normalize-number (value)
+  "Normalize frame coordinate VALUE to a number."
+  (cond
+   ((numberp value) value)
+   ((stringp value)
+    (if (string-empty-p value)
+        0
+      (string-to-number value)))
+   (t 0)))
+
+(defun eaf--macos-frame-left (frame)
+  "Return FRAME left position using the same logic as the PyQt host."
+  (let ((left (frame-parameter frame 'left)))
+    (eaf--macos-normalize-number (if (listp left) (car left) left))))
+
+(defun eaf--macos-frame-top (frame)
+  "Return FRAME top position using the same logic as the PyQt host."
+  (let ((top (frame-parameter frame 'top)))
+    (eaf--macos-normalize-number (if (listp top) (nth 1 top) top))))
+
+(defun eaf--macos-frame-internal-height (frame)
+  "Return title/tool bar height for FRAME."
+  (let ((geometry (frame-geometry frame)))
+    (+ (or (cdr (alist-get 'title-bar-size geometry)) 0)
+       (or (cdr (alist-get 'tool-bar-size geometry)) 0))))
+
+(defun eaf--macos-frame-window-number (frame)
+  "Return native window number for FRAME."
+  (eaf--macos-normalize-number
+   (or (frame-parameter frame 'window-id)
+       (frame-parameter frame 'outer-window-id)
+       0)))
+
+(defun eaf--macos-window-local-geometry (window)
+  "Return WINDOW geometry in frame-local top-left coordinates."
+  (let* ((edges (or (window-body-pixel-edges window)
+                    (window-inside-pixel-edges window)
+                    (window-pixel-edges window)))
+         (x (nth 0 edges))
+         (y (nth 1 edges))
+         (w (- (nth 2 edges) x))
+         (h (max 1 (- (nth 3 edges) y))))
+    (list x y w h)))
+
 (defun eaf--generate-id ()
   "Randomly generate a seven digit id used for EAF buffers."
   (format "%04x-%04x-%04x-%04x-%04x-%04x-%04x"
@@ -844,9 +1174,19 @@ We need calcuate render allocation to make sure no black border around render co
           (random (expt 16 4))
           (random (expt 16 4))
           (random (expt 16 4))
-          (random (expt 16 4))
-          (random (expt 16 4))
-          (random (expt 16 4))))
+         (random (expt 16 4))
+         (random (expt 16 4))
+         (random (expt 16 4))))
+
+(defun eaf--window-view-id (window buffer-id)
+  "Return a stable native view id for WINDOW showing BUFFER-ID."
+  (let ((view-id (window-parameter window 'eaf-view-id))
+        (owner (window-parameter window 'eaf-view-buffer-id)))
+    (unless (and view-id owner (equal owner buffer-id))
+      (setq view-id (eaf--generate-id))
+      (set-window-parameter window 'eaf-view-id view-id)
+      (set-window-parameter window 'eaf-view-buffer-id buffer-id))
+    view-id))
 
 (defun eaf-execute-app-cmd (cmd &optional buf)
   "Execute app CMD.
@@ -971,9 +1311,27 @@ keybinding variable to eaf-app-binding-alist."
   (symbol-value
    (cdr (assoc app-name eaf-app-binding-alist))))
 
+(defun eaf--app-feature-name (app-name)
+  "Return the feature symbol used by APP-NAME's elisp entrypoint."
+  (intern (format "eaf-%s" app-name)))
+
+(defun eaf--ensure-app-loaded (app-name)
+  "Load APP-NAME's elisp entrypoint on demand."
+  (unless (assoc app-name eaf-app-module-path-alist)
+    (let ((feature (eaf--app-feature-name app-name)))
+      (unless (featurep feature)
+        (require feature nil t)))))
+
 (defun eaf--get-app-module-path (app-name)
+  (eaf--ensure-app-loaded app-name)
   (symbol-value
    (cdr (assoc app-name eaf-app-module-path-alist))))
+
+(defun eaf--get-app-name-by-module-path (module-path)
+  "Return the EAF app name that registered MODULE-PATH."
+  (or (car (cl-rassoc module-path eaf-app-module-path-alist :test #'equal))
+      (file-name-nondirectory
+       (directory-file-name (file-name-directory module-path)))))
 
 (defun eaf--get-app-hook (app-name)
   (funcall
@@ -981,10 +1339,18 @@ keybinding variable to eaf-app-binding-alist."
 
 (defun eaf--create-buffer (url app-name args)
   "Create an EAF buffer given URL, APP-NAME, and ARGS."
+  (eaf--ensure-app-loaded app-name)
   (eaf--gen-keybinding-map (eaf--get-app-bindings app-name))
-  (let* ((eaf-buffer-name (if (equal (file-name-nondirectory url) "")
-                              url
-                            (file-name-nondirectory url)))
+  (let* ((url-name (and (stringp url) (file-name-nondirectory url)))
+         (eaf-buffer-name (cond
+                           ((and (stringp url-name)
+                                 (not (string-empty-p url-name)))
+                            url-name)
+                           ((and (stringp url)
+                                 (not (string-empty-p url)))
+                            url)
+                           (t
+                            (format "eaf-%s" app-name))))
          (eaf-buffer (generate-new-buffer eaf-buffer-name))
          (url-directory (or (file-name-directory url) url)))
     (with-current-buffer eaf-buffer
@@ -1008,18 +1374,20 @@ keybinding variable to eaf-app-binding-alist."
       (setq mode-name (concat "EAF/" app-name)))
     eaf-buffer))
 
-(defun eaf-monitor-window-size-change (frame)
-  "Delay some time and run `eaf-try-adjust-view-with-frame-size' to compare with Emacs FRAME size."
-  (when (eaf-epc-live-p eaf-epc-process)
-    (setq eaf-last-frame-width (frame-pixel-width frame))
-    (setq eaf-last-frame-height (frame-pixel-height frame))
-    (run-with-timer 1 nil (lambda () (eaf-try-adjust-view-with-frame-size frame)))))
+(defun eaf--schedule-frame-lifecycle-sync (&optional frame)
+  "Refresh EAF geometry after FRAME lifecycle changes."
+  (when (and (or (eaf-epc-live-p eaf-epc-process) (eaf--macos-embedded-p))
+             eaf--monitor-configuration-p)
+    (ignore-errors
+      (eaf-monitor-configuration-change))))
 
-(defun eaf-try-adjust-view-with-frame-size (frame)
-  "Update EAF view once Emacs window size of the FRAME is changed."
-  (unless (and (equal (frame-pixel-width frame) eaf-last-frame-width)
-               (equal (frame-pixel-height frame) eaf-last-frame-height))
-    (eaf-monitor-configuration-change)))
+(defun eaf-monitor-window-size-change (frame)
+  "Refresh EAF geometry after Emacs FRAME size changes."
+  (when (and frame
+             (frame-live-p frame)
+             (or (eaf-epc-live-p eaf-epc-process) (eaf--macos-embedded-p)))
+    (ignore-errors
+      (eaf-monitor-configuration-change))))
 
 (defun eaf--frame-left (frame)
   "Return outer left position"
@@ -1053,16 +1421,14 @@ Including title-bar, menu-bar, offset depends on window system, and border."
 (eval-and-compile
 
   (defun eaf-emacs-not-use-reparent-technology ()
-    "When Emacs running in macOS、Wayland native or terminal environment,
-we can't use 'cross-process reparent' technicality like we does in X11, XWayland or Windows.
+    "When Emacs runs in Wayland native mode, EAF cannot use cross-process reparenting.
 
 In this situation, we use 'stay on top' technicality that show EAF window when Emacs get focus, hide EAF window when Emacs lost focus.
 
 'Stay on top' technicality is not perfect like 'cross-process reparent' technicality,
 provide at least one way to let everyone experience EAF. ;)"
-    (or (eq system-type 'darwin)              ;macOS
-        (eaf-emacs-running-in-wayland-native) ;Wayland native
-        ))
+    (eaf-emacs-running-in-wayland-native) ;Wayland native
+    )
 
   (defun eaf-emacs-running-in-wayland-native ()
     (eq window-system 'pgtk))
@@ -1082,9 +1448,7 @@ provide at least one way to let everyone experience EAF. ;)"
 
     (defun eaf--topmost-focus-change ()
       "Manage Emacs's focus change."
-      (let* ((front (cond ((eq system-type 'darwin)
-                           (string-trim (shell-command-to-string "osascript -e 'tell application \"System Events\" to get name of first application process whose frontmost is true'")))
-                          ((eaf--on-sway-p)
+      (let* ((front (cond ((eaf--on-sway-p)
                            (if (executable-find "jq")
                                (shell-command-to-string "swaymsg -t get_tree | jq -r '..|try select(.focused == true).app_id'")
                              (message "Please install jq for swaywm support.")))
@@ -1158,11 +1522,12 @@ provide at least one way to let everyone experience EAF. ;)"
     (add-hook 'eaf-start-process-hook
               (lambda ()
                 (add-function :after after-focus-change-function #'eaf--topmost-focus-change)
-                (add-to-list 'move-frame-functions #'eaf-monitor-configuration-change)))
+                (add-to-list 'move-frame-functions #'eaf--safe-monitor-configuration-change)))
 
     (add-hook 'eaf-stop-process-hook
               (lambda ()
                 (remove-function after-focus-change-function #'eaf--topmost-focus-change)
+                (remove-hook 'move-frame-functions #'eaf--safe-monitor-configuration-change)
                 (remove-hook 'move-frame-functions #'eaf-monitor-configuration-change)))
 
     (add-to-list 'delete-frame-functions #'eaf--topmost-delete-frame-handler)))
@@ -1170,43 +1535,73 @@ provide at least one way to let everyone experience EAF. ;)"
 (defun eaf-monitor-configuration-change (&rest _)
   "EAF function to respond when detecting a window configuration change."
   (when (and eaf--monitor-configuration-p
-             (eaf-epc-live-p eaf-epc-process)
-             ;; When current frame is same with `eaf-emacs-frame'.
-             (equal (window-frame) eaf-emacs-frame))
+             (or (eaf--macos-embedded-p) (eaf-epc-live-p eaf-epc-process))
+             (or (eaf--macos-embedded-p)
+                 ;; When current frame is same with `eaf-emacs-frame'.
+                 (equal (window-frame) eaf-emacs-frame)))
     (ignore-errors
-      (let (view-infos)
-        (dolist (frame (frame-list))
-          (dolist (window (window-list frame))
-            (with-current-buffer (window-buffer window)
-              (when (derived-mode-p 'eaf-mode)
-                ;; When `eaf-fullscreen-p' is non-nil, and only the EAF window is present, use frame size
-                (if (and eaf-fullscreen-p
-                         (equal (length (cl-remove-if #'window-dedicated-p (window-list frame))) 1))
-                    (push (format "%s:%s:%s:%s:%s:%s"
-                                  eaf--buffer-id
-                                  (eaf-get-emacs-xid frame)
-                                  0 0 (frame-pixel-width frame) (frame-pixel-height frame))
-                          view-infos)
-                  (let* ((window-allocation (eaf-get-window-allocation window))
-                         (window-divider-right-padding (if window-divider-mode window-divider-default-right-width 0))
-                         (window-divider-bottom-padding (if window-divider-mode window-divider-default-bottom-width 0))
-                         (titlebar-height (eaf--get-titlebar-height))
-                         (frame-coordinate (eaf--get-frame-coordinate))
-                         (frame-x (car frame-coordinate))
-                         (frame-y (cadr frame-coordinate))
-                         (x (+ (eaf--buffer-x-position-adjust frame) (nth 0 window-allocation)))
-                         (y (+ (eaf--buffer-y-position-adjust frame) (nth 1 window-allocation)))
-                         (w (nth 2 window-allocation))
-                         (h (nth 3 window-allocation)))
-                    (push (format "%s:%s:%s:%s:%s:%s"
-                                  eaf--buffer-id
-                                  (eaf-get-emacs-xid frame)
-                                  (+ x frame-x)
-                                  (+ y titlebar-height frame-y)
-                                  (- w window-divider-right-padding)
-                                  (- h window-divider-bottom-padding))
-                          view-infos)))))))
-        (eaf-call-async "update_views" (mapconcat #'identity view-infos ","))))))
+      (if (and (eaf--macos-embedded-p)
+               (fboundp 'eaf-macos-update-views))
+          (let (macos-view-specs)
+            (dolist (frame (frame-list))
+              (dolist (window (window-list frame))
+                (with-current-buffer (window-buffer window)
+                  (when (derived-mode-p 'eaf-mode)
+                    (let* ((view-id (eaf--window-view-id window eaf--buffer-id))
+                           (frame (window-frame window))
+                           (frame-window-number (eaf--macos-frame-window-number frame))
+                           (frame-width (frame-pixel-width frame))
+                           (frame-height (frame-pixel-height frame))
+                           (local-geometry (eaf--macos-window-local-geometry window))
+                           (local-x (nth 0 local-geometry))
+                           (local-y (nth 1 local-geometry))
+                           (local-w (nth 2 local-geometry))
+                           (local-h (nth 3 local-geometry)))
+                      (unless (or (<= frame-width 0) (<= frame-height 0)
+                                  (<= local-w 0) (<= local-h 0))
+                        (push (format "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s"
+                                      eaf--buffer-id
+                                      view-id
+                                      frame-window-number
+                                      frame-width
+                                      frame-height
+                                      local-x local-y local-w local-h)
+                              macos-view-specs)))))))
+            (eaf-macos-update-views (mapconcat #'identity (nreverse macos-view-specs) "\n")))
+        (let (view-infos)
+          (dolist (frame (frame-list))
+            (dolist (window (window-list frame))
+              (with-current-buffer (window-buffer window)
+                (when (derived-mode-p 'eaf-mode)
+                  ;; When `eaf-fullscreen-p' is non-nil, and only the EAF window is present, use frame size
+                  (if (and (not (eaf--macos-embedded-p))
+                           eaf-fullscreen-p
+                           (equal (length (cl-remove-if #'window-dedicated-p (window-list frame))) 1))
+                      (push (format "%s:%s:%s:%s:%s:%s"
+                                    eaf--buffer-id
+                                    (eaf-get-emacs-xid frame)
+                                    0 0 (frame-pixel-width frame) (frame-pixel-height frame))
+                            view-infos)
+                    (let* ((window-allocation (eaf-get-window-allocation window))
+                           (window-divider-right-padding (if window-divider-mode window-divider-default-right-width 0))
+                           (window-divider-bottom-padding (if window-divider-mode window-divider-default-bottom-width 0))
+                           (titlebar-height (eaf--get-titlebar-height))
+                           (frame-coordinate (eaf--get-frame-coordinate))
+                           (frame-x (car frame-coordinate))
+                           (frame-y (cadr frame-coordinate))
+                           (x (+ (eaf--buffer-x-position-adjust frame) (nth 0 window-allocation)))
+                           (y (+ (eaf--buffer-y-position-adjust frame) (nth 1 window-allocation)))
+                           (w (nth 2 window-allocation))
+                           (h (nth 3 window-allocation)))
+                      (push (format "%s:%s:%s:%s:%s:%s"
+                                    eaf--buffer-id
+                                    (eaf-get-emacs-xid frame)
+                                    (+ x frame-x)
+                                    (+ y titlebar-height frame-y)
+                                    (- w window-divider-right-padding)
+                                    (- h window-divider-bottom-padding))
+                            view-infos)))))))
+          (eaf-call-async "update_views" (mapconcat #'identity view-infos ",")))))))
 
 (defun eaf--split-number (string)
   (mapcar #'string-to-number (split-string string)))
@@ -1214,7 +1609,7 @@ provide at least one way to let everyone experience EAF. ;)"
 (defun eaf--get-frame-coordinate ()
   "We need fetch Emacs coordinate to adjust coordinate of EAF if it running on system not support cross-process reparent technology.
 
-Such as, wayland native, macOS etc."
+Such as Wayland native."
   (if (eaf-emacs-running-in-wayland-native)
       (cond ((eaf--on-sway-p)
              (eaf--split-number (shell-command-to-string
@@ -1265,6 +1660,8 @@ Such as, wayland native, macOS etc."
 (defun eaf--monitor-buffer-kill ()
   "A function monitoring when an EAF buffer is killed."
   (ignore-errors
+    (when (and (eq system-type 'darwin) (fboundp 'eaf-macos-destroy-buffer-views))
+      (eaf-macos-destroy-buffer-views eaf--buffer-id))
     (eaf-call-async "kill_buffer" eaf--buffer-id))
 
   ;; Kill eaf process when last eaf buffer closed.
@@ -1368,15 +1765,24 @@ of `eaf--buffer-app-name' inside the EAF buffer."
      nil)))
 
 (defun eaf-get-window-size-by-buffer-id (buffer-id)
+  "Return the current window allocation for BUFFER-ID."
   (let ((buffer (eaf-get-buffer buffer-id)))
     (when buffer
       (eaf-get-window-allocation (get-buffer-window buffer)))))
 
+(defvar eaf--focus-buffer-in-progress nil
+  "Non-nil while EAF is selecting a window from an embedded focus callback.")
+
 (defun eaf-focus-buffer (buffer-id)
   "Focus the buffer given the BUFFER-ID."
-  (let* ((buffer (eaf-get-buffer buffer-id))
-         (window (if buffer (get-buffer-window buffer 'visible) nil)))
-    (when window (select-window window) t)))
+  (unless eaf--focus-buffer-in-progress
+    (let* ((buffer (eaf-get-buffer buffer-id))
+           (window (if buffer (get-buffer-window buffer 'visible) nil)))
+      (when window
+        (unless (eq window (selected-window))
+          (let ((eaf--focus-buffer-in-progress t))
+            (select-window window)))
+        t))))
 
 (defvar-local eaf-buffer-input-focus nil)
 (defun eaf-update-focus-state (buffer-id state)
@@ -1515,7 +1921,30 @@ WEBENGINE-INCLUDE-PRIVATE-CODEC is only useful when app-name is video-player."
         (funcall (cdr app-hook))))
 
     (eaf--update-modeline-icon)
-    (eaf--preview-display-buffer eaf--buffer-app-name buffer)))
+    (eaf--preview-display-buffer eaf--buffer-app-name buffer)
+
+    (when (eaf--macos-embedded-p)
+      (run-with-idle-timer 0 nil #'eaf-monitor-configuration-change)
+      (eaf--schedule-macos-embedded-view-sync-retries))))
+
+(defun eaf--create-browser-derived-buffer (buffer-id module-path &optional url args)
+  "Create an Emacs buffer for an already-created BrowserBuffer-derived app."
+  (let* ((app-name (eaf--get-app-name-by-module-path module-path))
+         (buffer-name (concat (buffer-name (car (buffer-list))) " "))
+         (eaf-buffer (generate-new-buffer buffer-name)))
+    (with-current-buffer eaf-buffer
+      (eaf--gen-keybinding-map (eaf--get-app-bindings app-name))
+      (eaf-mode)
+      (setq-local confirm-kill-processes nil)
+      (set (make-local-variable 'eaf--buffer-id) buffer-id)
+      (set (make-local-variable 'eaf--buffer-url) (or url ""))
+      (set (make-local-variable 'eaf--buffer-app-name) app-name)
+      (set (make-local-variable 'eaf--buffer-args) (or args ""))
+      (setq mode-name (concat "EAF/" app-name)))
+    (switch-to-buffer eaf-buffer)
+    ;; Popup/devtools creation often leaves stale minibuffer text behind.
+    (message nil)
+    eaf-buffer))
 
 (defun eaf--rebuild-buffer ()
   (if eaf-rebuild-buffer-after-crash
@@ -1627,11 +2056,14 @@ When called interactively, URL accepts a file that can be opened by EAF."
   (setq always-new (or always-new current-prefix-arg))
 
   ;; Hooks are only added if not present already...
-  (add-hook 'window-size-change-functions #'eaf-monitor-window-size-change)
-  (add-hook 'window-configuration-change-hook #'eaf-monitor-configuration-change)
+  (add-hook 'window-size-change-functions #'eaf--safe-monitor-window-size-change)
+  (add-hook 'window-configuration-change-hook #'eaf--safe-monitor-configuration-change)
+  (add-hook 'move-frame-functions #'eaf--safe-monitor-configuration-change)
+  (add-hook 'after-make-frame-functions #'eaf--safe-frame-lifecycle-sync)
+  (add-hook 'delete-frame-functions #'eaf--safe-frame-lifecycle-sync)
 
   ;; Open URL with EAF application
-  (if (eaf-epc-live-p eaf-epc-process)
+  (if (or (eaf-epc-live-p eaf-epc-process) (eaf--macos-embedded-p))
       (let (exists-eaf-buffer)
         ;; Try to open buffer           ; ;
         (catch 'found-eaf
@@ -1807,9 +2239,16 @@ So multiple EAF buffers visiting the same file do not sync with each other."
           (shell-command-to-string (format "wmctrl -i -a $(wmctrl -lp | awk -vpid=$PID '$3==%s {print $1; exit}')" (emacs-pid)))
         (message "Please install wmctrl to active Emacs window.")))))
 
-(defun eaf--activate-emacs-mac-window()
-  "Activate Emacs macOS window."
-  (shell-command-to-string "open -a emacs"))
+(defun eaf--activate-emacs-mac-window (&optional buffer-id)
+  "Activate the current Emacs macOS window.
+When BUFFER-ID is non-nil and the native EAF view exists, prefer that
+hosting window. Fall back to activating the Emacs app bundle only when
+the native module entrypoint is unavailable."
+  (if (fboundp 'eaf-macos-activate-emacs-window)
+      (if buffer-id
+          (eaf-macos-activate-emacs-window buffer-id)
+        (eaf-macos-activate-emacs-window))
+    (shell-command-to-string "open -a emacs")))
 
 (defun eaf-activate-emacs-window(&optional buffer_id)
   "Activate Emacs window."
@@ -1818,7 +2257,7 @@ So multiple EAF buffers visiting the same file do not sync with each other."
         (eaf--called-from-wsl-on-windows-p))
     (eaf--activate-emacs-win32-window))
    ((eq system-type 'darwin)
-    (eaf--activate-emacs-mac-window))
+    (eaf--activate-emacs-mac-window buffer_id))
    ((or (eq system-type 'gnu/linux)
         (eq system-type 'berkeley-unix))
     (eaf--activate-emacs-linux-window buffer_id))))
@@ -1899,12 +2338,16 @@ You can configure a blacklist using `eaf-find-file-ext-blacklist'"
       (eaf-open (eaf-get-path-or-url) "airshare")
     (message "You should install EAF application 'airshare' first.")))
 
-(defun eaf-open-devtool-page ()
-  "Use EAF Browser to open the devtools page."
-  (delete-other-windows)
-  (split-window (selected-window) (round (* (nth 3 (eaf-get-window-allocation (selected-window))) 0.618)) nil t)
-  (other-window 1)
-  (eaf-open "about:blank" "browser" "devtools"))
+(defun eaf-open-devtool-page (&optional module-path)
+  "Use a BrowserBuffer-derived EAF app to open the devtools page."
+  (interactive)
+  (let ((app-name (if module-path
+                      (eaf--get-app-name-by-module-path module-path)
+                    "browser")))
+    (delete-other-windows)
+    (split-window (selected-window) (round (* (nth 3 (eaf-get-window-allocation (selected-window))) 0.618)) nil t)
+    (other-window 1)
+    (eaf-open "about:blank" app-name "devtools")))
 
 ;;;;;;;;;;;;;;;;;;;; Advice ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 

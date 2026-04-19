@@ -50,7 +50,8 @@
     "npm"
   ],
   "brew": [
-    "node"
+    "node",
+    "python"
   ],
   "pip": {
     "pacman": [
@@ -83,11 +84,9 @@
       "PyQt6-WebEngine-Qt6==6.5.0"
     ],
     "darwin": [
-      "epc",
       "sexpdata==1.0.0",
       "tld",
       "lxml",
-      "mac-app-frontmost",
       "PyQt6==6.5.0",
       "PyQt6-Qt6==6.5.0",
       "PyQt6-sip",

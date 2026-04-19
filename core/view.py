@@ -19,12 +19,16 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+import sys
 import platform
 
 from core.utils import current_desktop, eval_in_emacs, focus_emacs_buffer, get_emacs_func_cache_result, get_emacs_var
-from PyQt6.QtCore import QEvent, QPoint, Qt
+from PyQt6.QtCore import QEvent, QPoint, QTimer, Qt
 from PyQt6.QtGui import QBrush, QPainter, QWindow
-from PyQt6.QtWidgets import QFrame, QGraphicsView, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QApplication, QFrame, QGraphicsView, QVBoxLayout, QWidget
+
+IS_DARWIN = sys.platform == "darwin"
+IS_WINDOWS = sys.platform == "win32"
 
 if current_desktop in ["sway", "Hyprland"] and get_emacs_func_cache_result("eaf-emacs-running-in-wayland-native", []):
     global reinput
@@ -61,7 +65,19 @@ class View(QWidget):
         else:
             self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
 
-        self.is_member_of_focus_fix_wms = get_emacs_var("eaf-is-member-of-focus-fix-wms")
+        if IS_DARWIN:
+            self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+            self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+            self.setAttribute(Qt.WidgetAttribute.WA_MacShowFocusRect, False)
+            self.setWindowFlag(Qt.WindowType.WindowDoesNotAcceptFocus, True)
+            self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        # eaf-is-member-of-focus-fix-wms only applies to X11 WMs (i3, bspwm, etc.).
+        # On macOS there are no such WMs, and this call must not block the main thread.
+        if IS_DARWIN:
+            self.is_member_of_focus_fix_wms = False
+        else:
+            self.is_member_of_focus_fix_wms = get_emacs_var("eaf-is-member-of-focus-fix-wms")
 
         self.setAttribute(Qt.WidgetAttribute.WA_X11DoNotAcceptFocus, True)
         self.setContentsMargins(0, 0, 0, 0)
@@ -75,6 +91,11 @@ class View(QWidget):
         self.y: int = int(self.y)
         self.width: int = int(self.width)
         self.height: int = int(self.height)
+        self._requested_width = self.width
+        self._requested_height = self.height
+        self._host_window = None
+        self._did_reparent = False
+        self._reparent_in_progress = False
 
         # Build QGraphicsView.
         self.layout: QVBoxLayout = QVBoxLayout(self)
@@ -87,6 +108,7 @@ class View(QWidget):
         self.graphics_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.graphics_view.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform | QPainter.RenderHint.TextAntialiasing)
         self.graphics_view.setFrameStyle(QFrame.Shape.NoFrame)
+        self.graphics_view.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
 
         # Fill background color.
         self.graphics_view.setBackgroundBrush(QBrush(buffer.background_color))
@@ -98,18 +120,60 @@ class View(QWidget):
         self.show()
 
         # Resize after show to trigger fit view operation.
-        self.resize(self.width, self.height)
+        self.resize(self._requested_width, self._requested_height)
 
         self.buffer.aspect_ratio_change.connect(self.adjust_aspect_ratio)
 
         self.locate()
 
     def resizeEvent(self, event):
+        self.width = event.size().width()
+        self.height = event.size().height()
+
+        if self.buffer.fit_to_view:
+            self.adjust_aspect_ratio()
+
         # Fit content to view rect just when buffer fit_to_view option is enable.
         if self.buffer.fit_to_view:
-            if event.oldSize().isValid():
-                self.graphics_view.fitInView(self.graphics_view.scene().sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
-                QWidget.resizeEvent(self, event)
+            if event.oldSize().isValid() or IS_DARWIN:
+                self._fit_buffer_to_view()
+
+        QWidget.resizeEvent(self, event)
+
+    def update_view_info(self, view_info):
+        if view_info == self.view_info:
+            return
+
+        old_host = self.emacs_xid
+        self.view_info = view_info
+        (self.buffer_id, self.emacs_xid, self.x, self.y, self.width, self.height) = view_info.split(":")
+        self.x = int(self.x)
+        self.y = int(self.y)
+        self.width = int(self.width)
+        self.height = int(self.height)
+
+        if self.emacs_xid != old_host:
+            self._host_window = None
+            self._did_reparent = False
+
+        self.resize(self.width, self.height)
+
+        if IS_DARWIN and (self.emacs_xid != old_host or not self._did_reparent):
+            self.reparent()
+
+    def _sync_embedded_geometry(self):
+        qwindow = self.windowHandle()
+        if qwindow is None:
+            return
+
+        qwindow.setGeometry(0, 0, self.width, self.height)
+
+    def _schedule_embedded_attach_retries(self):
+        if not IS_DARWIN:
+            return
+
+        if self.buffer.fit_to_view:
+            QTimer.singleShot(0, self._fit_buffer_to_view)
 
     def adjust_aspect_ratio(self):
         widget_width = self.width
@@ -128,6 +192,18 @@ class View(QWidget):
             self.buffer.buffer_widget.resize(int(view_width), int(view_height))
 
             self.layout.setContentsMargins(int(horizontal_padding), int(vertical_padding), int(horizontal_padding), int(vertical_padding))
+
+        self.buffer.setSceneRect(0, 0, self.buffer.buffer_widget.width(), self.buffer.buffer_widget.height())
+
+    def _fit_buffer_to_view(self):
+        self.graphics_view.resetTransform()
+
+        # If the widget has already been resized to the viewport, an extra
+        # fitInView pass only reintroduces scaling drift on repeated retries.
+        if self.buffer.aspect_ratio == 0:
+            return
+
+        self.graphics_view.fitInView(self.graphics_view.scene().sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
     def is_switch_from_other_application(self, event):
         # When switch to Emacs from other application, such as Alt + Tab.
@@ -153,13 +229,14 @@ class View(QWidget):
         # import time
         # current_time = time.time()
         # print(f"{current_time:.6f}" + " " + event.type().name)
+        event_type = event.type()
 
         # Focus emacs window when event type match below event list.
         # Make sure EAF window always response user key event after switch from other application, such as Alt + Tab.
         if current_desktop in ["sway", "Hyprland"] and get_emacs_func_cache_result("eaf-emacs-running-in-wayland-native", []):
-            if event.type() == QEvent.Type.WindowActivate:
+            if event_type == QEvent.Type.WindowActivate:
                 focus()
-            elif event.type() == QEvent.Type.WindowDeactivate:
+            elif event_type == QEvent.Type.WindowDeactivate:
                 lose_focus()
 
         if self.is_switch_from_other_application(event):
@@ -183,21 +260,47 @@ class View(QWidget):
         # NOTE: we must reparent after widget show, otherwise reparent operation maybe failed.
         self.reparent()
 
-        if platform.system() in ["Windows", "Darwin"]:
+        if IS_WINDOWS or IS_DARWIN:
             eval_in_emacs('eaf-activate-emacs-window', [])
 
         # Make graphics view at left-top corner after show.
         self.graphics_view.verticalScrollBar().setValue(0)
         self.graphics_view.horizontalScrollBar().setValue(0)
 
+        self._schedule_embedded_attach_retries()
+
+        QWidget.showEvent(self, event)
+
     def reparent(self):
-        # print("Reparent: ", self.buffer.url)
         qwindow = self.windowHandle()
 
-        if not get_emacs_func_cache_result("eaf-emacs-not-use-reparent-technology", []):
-            qwindow.setParent(QWindow.fromWinId(int(self.emacs_xid)))    # type: ignore
+        if IS_DARWIN:
+            # emacs_xid is an EAFHostView* pointer passed by the macOS dynamic module.
+            # Embed this Qt window inside the NSView; position is (0,0) within the host.
+            if qwindow is None:
+                self.winId()
+                qwindow = self.windowHandle()
 
-        qwindow.setPosition(QPoint(self.x, self.y))
+            if qwindow is None or self._reparent_in_progress:
+                return
+            self._reparent_in_progress = True
+            try:
+                if self._host_window is None:
+                    self._host_window = QWindow.fromWinId(int(self.emacs_xid))  # type: ignore
+
+                if qwindow.parent() is not self._host_window:
+                    qwindow.setParent(self._host_window)
+                if not self._did_reparent:
+                    self._did_reparent = True
+                    QTimer.singleShot(0, qwindow.show)
+
+                qwindow.requestUpdate()
+            finally:
+                self._reparent_in_progress = False
+        else:
+            if not get_emacs_func_cache_result("eaf-emacs-not-use-reparent-technology", []):
+                qwindow.setParent(QWindow.fromWinId(int(self.emacs_xid)))    # type: ignore
+            qwindow.setPosition(QPoint(self.x, self.y))
 
     def try_show_top_view(self):
         if get_emacs_func_cache_result("eaf-emacs-not-use-reparent-technology", []):

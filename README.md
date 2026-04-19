@@ -83,6 +83,12 @@ chmod +x ./install-eaf.py
 
 There are many useful flags available for `install-eaf.py`, check it yourself using `--help`.
 
+On macOS, `install-eaf.py` now also installs Homebrew system packages listed in `dependencies.json` and builds the native module at `core/macos/eaf-macos-module.so` automatically. Make sure Xcode Command Line Tools are installed, and use a Python that ships development headers and libraries; Homebrew `python` is the recommended default. If your Emacs app bundle is not at `/Applications/Emacs.app`, rebuild manually with:
+
+```Bash
+EMACS_APP=/path/to/Emacs.app make -C core/macos PYTHON="$(command -v python3)"
+```
+
 #### 3. Load EAF Core
 
 From here on, you can add the full path to the EAF installation directory to your Emacs ```load-path```, then add the following to `init.el`:
