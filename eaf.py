@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import QTimer, QThread
 from core.utils import PostGui, eval_in_emacs, get_emacs_func_result, get_emacs_var, init_epc_client, close_epc_client, message_to_emacs, get_emacs_vars, get_emacs_config_dir
 import base64
+import inspect
 import json
 import os
 import platform
@@ -41,6 +42,17 @@ proxy_string = ""
 emacs_width = 0
 emacs_height = 0
 _eaf_embedded_instance = None
+
+
+def resize_buffer_view(buffer, width, height):
+    resize_view = getattr(buffer, "resize_view")
+
+    # App repos are kept unmodified on the mac-port branch, so core has to
+    # tolerate both the old `resize_view(self)` and the newer optional-size API.
+    if len(inspect.signature(resize_view).parameters) == 0:
+        resize_view()
+    else:
+        resize_view(width, height)
 
 class EAF(object):
     def __init__(self, args, embedded=False):
@@ -301,7 +313,7 @@ class EAF(object):
                         buffer.buffer_widget.resize(emacs_width, emacs_height)
 
                     # Avoid sync Emacs queries from the Qt/AppKit thread on macOS.
-                    buffer.resize_view(buffer.buffer_widget.width(), buffer.buffer_widget.height())
+                    resize_buffer_view(buffer, buffer.buffer_widget.width(), buffer.buffer_widget.height())
 
             # NOTE:
             # When you do switch buffer or kill buffer in Emacs, will call Python function 'update_views.
