@@ -25,8 +25,8 @@
     var cssSelector = "input, textarea, [contenteditable='true']";
 
     var elements = getVisibleElements(function(e, v) {
-        if ((e.matches('input') && !e.disabled && !e.readOnly && 
-            (e.type === "text" || e.type === "search" || e.type === "password")) || 
+        if ((e.matches('input') && !e.disabled && !e.readOnly &&
+            (e.type === "text" || e.type === "search" || e.type === "password")) ||
             (e.matches('textarea') && !e.disabled && !e.readOnly) ||
             (e.contentEditable === "true")) {
             v.push(e);
@@ -36,7 +36,7 @@
     if (elements.length === 0 && document.querySelector(cssSelector) !== null) {
         document.querySelector(cssSelector).scrollIntoView();
         elements = getVisibleElements(function(e, v) {
-            if ((e.matches(cssSelector) && !e.disabled && !e.readOnly) || 
+            if ((e.matches(cssSelector) && !e.disabled && !e.readOnly) ||
                 (e.contentEditable === "true")) {
                 v.push(e);
             }

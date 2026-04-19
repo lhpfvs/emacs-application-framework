@@ -702,6 +702,13 @@ Note, we need hook this function to signal 'loadProgress', signal 'loadStarted' 
 
         return self.execute_js(self.get_focus_text_js)
 
+    def get_focus_text_async(self, callback):
+        ''' Query the focused text without entering a nested event loop.'''
+        if self.get_focus_text_js is None:
+            self.get_focus_text_js = self.read_js_content("get_focus_text.js")
+
+        self.web_page.runJavaScript(self.get_focus_text_js, callback)
+
     @interactive
     def set_focus_text(self, new_text):
         ''' Set the focus text.'''
@@ -843,6 +850,7 @@ class BrowserBuffer(Buffer):
         self.profile = webengine_profile
 
         self.add_widget(BrowserView(self.profile, buffer_id))
+        self._set_page_lifecycle_state(QWebEnginePage.LifecycleState.Active)
 
         self.url = url
 
@@ -965,6 +973,28 @@ class BrowserBuffer(Buffer):
         self.channel = QWebChannel()
         self.channel.registerObject("pyobject", self)
         self.buffer_widget.web_page.setWebChannel(self.channel)
+
+    def _set_page_lifecycle_state(self, state):
+        web_page = getattr(self.buffer_widget, "web_page", None)
+        if web_page is None:
+            return
+        try:
+            if web_page.lifecycleState() != state:
+                web_page.setLifecycleState(state)
+        except Exception:
+            pass
+
+    def all_views_hide(self):
+        self._set_page_lifecycle_state(QWebEnginePage.LifecycleState.Frozen)
+
+    def some_view_show(self):
+        self._set_page_lifecycle_state(QWebEnginePage.LifecycleState.Active)
+
+    def resize_view(self, width=None, height=None):
+        if width is None or height is None:
+            return super().resize_view(width, height)
+        self.buffer_widget.resize(width, height)
+        self.buffer_widget.update()
 
     def add_widget(self, widget):
         super(BrowserBuffer, self).add_widget(widget)

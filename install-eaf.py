@@ -66,6 +66,7 @@ install_failed_sys = []
 install_failed_pys = []
 install_failed_npm_globals = []
 install_failed_apps = []
+install_failed_builds = []
 
 important_messages = [
     "[EAF] Please run 'git pull && ./install-eaf.py' (M-x eaf-install-and-update) to update EAF and their dependencies.",
@@ -143,6 +144,8 @@ def install_sys_deps(distro: str, deps_list):
         command = ['nix', 'profile', 'install']
     elif which("zypper"):
         command = ['sudo', 'zypper', 'install','-y']
+    elif distro == 'brew':
+        command = ['brew', 'install']
     command.extend(deps_list)
     try:
         run_command(command)
@@ -284,51 +287,58 @@ def add_or_update_app(app: str, app_spec_dict):
 
 def get_distro():
     distro = ""
-    if sys.platform != "linux":
-        pass
-    elif which("dnf"):
-        distro = "dnf"
-    elif which("emerge"):
-        distro = "emerge"
-    elif which("apt"):
-        distro = "apt"
-    elif which("pacman"):
-        distro = "pacman"
-        aur_helper = get_archlinux_aur_helper()
-        if (not args.ignore_core_deps and not args.ignore_sys_deps and len(args.install) == 0) or args.install_core_deps:
-            try:
-                run_command([aur_helper, '-Sy', '--noconfirm', '--needed'])
-            except:
-                print("Run command `{} -Sy --noconfirm --needed' failed.".format(aur_helper))
-
-    elif which("pkg"):
-        distro = "pkg"
-    elif which("guix"):
-        distro = "guix"
-    elif which("zypper"):
-        distro = "zypper"
-    elif which("brew"):
-        distro = "brew"
-    elif which("nix"):
-        distro = "nix"
-    elif which("xbps-install"):
-        distro = "xbps"
-    elif sys.platform == "linux":
-        print("[EAF] Unsupported Linux distribution/package manager.")
-        print(" Please see dependencies.json for list of dependencies.")
-        if not (args.ignore_core_deps or args.ignore_sys_deps):
-            sys.exit(1)
+    if sys.platform == "linux":
+        if which("dnf"):
+            distro = "dnf"
+        elif which("emerge"):
+            distro = "emerge"
+        elif which("apt"):
+            distro = "apt"
+        elif which("pacman"):
+            distro = "pacman"
+            aur_helper = get_archlinux_aur_helper()
+            if (not args.ignore_core_deps and not args.ignore_sys_deps and len(args.install) == 0) or args.install_core_deps:
+                try:
+                    run_command([aur_helper, '-Sy', '--noconfirm', '--needed'])
+                except:
+                    print("Run command `{} -Sy --noconfirm --needed' failed.".format(aur_helper))
+        elif which("pkg"):
+            distro = "pkg"
+        elif which("guix"):
+            distro = "guix"
+        elif which("zypper"):
+            distro = "zypper"
+        elif which("brew"):
+            distro = "brew"
+        elif which("nix"):
+            distro = "nix"
+        elif which("xbps-install"):
+            distro = "xbps"
+        else:
+            print("[EAF] Unsupported Linux distribution/package manager.")
+            print(" Please see dependencies.json for list of dependencies.")
+            if not (args.ignore_core_deps or args.ignore_sys_deps):
+                sys.exit(1)
+    else:
+        if which("brew"):
+            distro = "brew"
+        elif which("pkg"):
+            distro = "pkg"
+        elif which("guix"):
+            distro = "guix"
+        elif which("nix"):
+            distro = "nix"
 
     return distro
 
 def install_core_deps(distro, deps_dict):
     print("[EAF] Installing core dependencies")
     core_deps = []
-    if not args.ignore_sys_deps and sys.platform == "linux":
+    if not args.ignore_sys_deps and distro in deps_dict:
         core_deps.extend(deps_dict[distro])
         if len(core_deps) > 0:
             install_sys_deps(distro, core_deps)
-    if (not args.ignore_py_deps or sys.platform != "linux") and sys.platform in deps_dict["pip"]:
+    if not args.ignore_py_deps and sys.platform in deps_dict["pip"]:
         # For pip dependencies, the distribution name takes precedence over the os name.
         #
         # For example, in Arch Linux, we need install PyQt from Arch repository to instead install from PIP repository
@@ -444,7 +454,7 @@ def install_app_deps(distro, deps_dict):
             if (updated or args.force) and os.path.exists(app_dep_path):
                 with open(app_dep_path) as f:
                     deps_dict = json.load(f)
-                if not args.ignore_sys_deps and sys.platform == "linux" and distro in deps_dict:
+                if not args.ignore_sys_deps and distro in deps_dict:
                     sys_deps.extend(deps_dict[distro])
                 if not args.ignore_py_deps and 'pip' in deps_dict and sys.platform in deps_dict['pip']:
                     py_deps.extend(deps_dict['pip'][sys.platform])
@@ -459,7 +469,7 @@ def install_app_deps(distro, deps_dict):
                         npm_rebuild_apps.append(app_path)
 
     print("\n[EAF] Installing dependencies for the selected applications")
-    if not args.ignore_sys_deps and sys.platform == "linux" and len(sys_deps) > 0:
+    if not args.ignore_sys_deps and len(sys_deps) > 0:
         print("[EAF] Installing system dependencies")
         install_sys_deps(distro, sys_deps)
     if not args.ignore_py_deps and len(py_deps) > 0:
@@ -507,10 +517,23 @@ def install_app_deps(distro, deps_dict):
         print_warning_message("\n[EAF] Installation FAILED for following applications:")
         for app in install_failed_apps:
             print_warning_message(app)
-    if len(install_failed_sys) + len(install_failed_pys) + len(install_failed_apps) == 0:
-        print("[EAF] Installation SUCCESS!")
-    else:
-        print("[EAF] Please rerun ./install-eaf.py with `--force`, or install them manually!")
+
+def build_macos_module():
+    module_path = os.path.join(script_path, "core", "macos")
+    if sys.platform != "darwin" or not os.path.isdir(module_path):
+        return
+
+    command = ["make", f"PYTHON={sys.executable}"]
+    emacs_app = os.getenv("EMACS_APP")
+    if emacs_app:
+        command.append(f"EMACS_APP={emacs_app}")
+
+    try:
+        print("[EAF] Building macOS native module")
+        run_command(command, path=module_path)
+    except Exception as e:
+        print("Error:", e)
+        install_failed_builds.append(' '.join(command) + " @ " + module_path)
 
 def print_warning_message(message):
     print(bcolors.WARNING + message + bcolors.ENDC)
@@ -531,6 +554,11 @@ def main():
             install_app_deps(distro, deps_dict)
             print("[EAF] ------------------------------------------")
 
+        if sys.platform == "darwin":
+            print("[EAF] ------------------------------------------")
+            build_macos_module()
+            print("[EAF] ------------------------------------------")
+
         current_desktop = os.getenv("XDG_CURRENT_DESKTOP") or os.getenv("XDG_SESSION_DESKTOP")
         if current_desktop in ["Hyprland", "sway"]:
             print("[EAF] Compiling reinput")
@@ -541,6 +569,24 @@ def main():
 
         for msg in important_messages:
             print_warning_message(msg)
+
+        if len(install_failed_builds) > 0:
+            print_warning_message("\n[EAF] Installation FAILED for the following build steps:")
+            for step in install_failed_builds:
+                print_warning_message(step)
+            print("[EAF] Please rerun ./install-eaf.py after fixing the macOS build prerequisites, or build the module manually.")
+
+        overall_failures = (
+            len(install_failed_sys)
+            + len(install_failed_pys)
+            + len(install_failed_npm_globals)
+            + len(install_failed_apps)
+            + len(install_failed_builds)
+        )
+        if overall_failures == 0:
+            print("[EAF] Installation SUCCESS!")
+        else:
+            print("[EAF] Please rerun ./install-eaf.py with `--force`, or install them manually!")
     except KeyboardInterrupt:
         print("[EAF] install-eaf.py aborted!")
         sys.exit()

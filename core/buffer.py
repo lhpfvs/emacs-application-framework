@@ -24,7 +24,7 @@ import string
 import time
 
 from core.utils import *
-from PyQt6.QtCore import QEvent, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QEvent, QRectF, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QCursor, QFocusEvent, QKeyEvent
 from PyQt6.QtWidgets import QApplication, QGraphicsScene
 
@@ -137,6 +137,7 @@ class Buffer(QGraphicsScene):
         self.current_event_string = ""
 
         self.buffer_widget = None
+        self.buffer_widget_proxy = None
         self.is_fullscreen = False
 
         self.aspect_ratio = 0
@@ -251,11 +252,25 @@ class Buffer(QGraphicsScene):
             self.background_color = QColor(self.theme_background_color)
 
         self.buffer_widget = widget
-        self.addWidget(self.buffer_widget)
+        self.buffer_widget_proxy = self.addWidget(self.buffer_widget)
 
         self.buffer_widget.installEventFilter(self)
 
         self.buffer_widget.buffer = self
+
+    def sync_widget_proxy_geometry(self):
+        ''' Keep the proxy item geometry aligned with the embedded widget.'''
+        if self.buffer_widget is None or self.buffer_widget_proxy is None:
+            return
+
+        width = max(1, self.buffer_widget.width())
+        height = max(1, self.buffer_widget.height())
+
+        self.buffer_widget_proxy.setVisible(True)
+        self.buffer_widget_proxy.setPos(0, 0)
+        self.buffer_widget_proxy.setGeometry(QRectF(0, 0, width, height))
+        self.buffer_widget_proxy.resize(width, height)
+        self.setSceneRect(0, 0, width, height)
 
     def destroy_buffer(self):
         ''' Destroy buffer.'''
@@ -282,8 +297,9 @@ class Buffer(QGraphicsScene):
         pass
 
     @abstract
-    def resize_view(self):
-        (_, _, width, height) = get_emacs_func_result("eaf-get-window-size-by-buffer-id", [self.buffer_id])
+    def resize_view(self, width=None, height=None):
+        if width is None or height is None:
+            (_, _, width, height) = get_emacs_func_result("eaf-get-window-size-by-buffer-id", [self.buffer_id])
         self.buffer_widget.resize(width, height)
 
     def get_key_event_widgets(self):

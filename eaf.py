@@ -27,8 +27,8 @@ from PyQt6 import QtWebEngineWidgets as NeverUsed # noqa
 from PyQt6.QtNetwork import QNetworkProxy, QNetworkProxyFactory
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import QTimer, QThread
-from core.utils import PostGui, eval_in_emacs, get_emacs_var, init_epc_client, close_epc_client, message_to_emacs, get_emacs_vars, get_emacs_config_dir
-from epc.server import ThreadingEPCServer
+from core.utils import PostGui, eval_in_emacs, get_emacs_func_result, get_emacs_var, init_epc_client, close_epc_client, message_to_emacs, get_emacs_vars, get_emacs_config_dir
+import base64
 import json
 import os
 import platform
@@ -37,8 +37,13 @@ import threading
 if platform.system() == "Windows":
     import pygetwindow as gw    # type: ignore
 
+proxy_string = ""
+emacs_width = 0
+emacs_height = 0
+_eaf_embedded_instance = None
+
 class EAF(object):
-    def __init__(self, args):
+    def __init__(self, args, embedded=False):
         global emacs_width, emacs_height, proxy_string
 
         # Parse init arguments.
@@ -48,9 +53,11 @@ class EAF(object):
 
         # Init variables.
         self.views_data = None
+        self.pending_views_data = None
         self.buffer_dict = {}
         self.view_dict = {}
-
+        self.destroy_view_list = []
+        self.devtools_page = None
         self.thread_queue = []
 
         for name in ["scroll_other_buffer", "eval_js_function", "eval_js_code", "action_quit", "send_key", "send_key_sequence",
@@ -60,16 +67,21 @@ class EAF(object):
         for name in ["execute_js_function", "execute_js_code", "execute_function", "execute_function_with_args"]:
             self.build_buffer_return_function(name)
 
-        # Init EPC client port.
-        init_epc_client(int(emacs_server_port))
+        if not embedded:
+            from epc.server import ThreadingEPCServer
 
-        # Build EPC server.
-        self.server = ThreadingEPCServer(('127.0.0.1', 0), log_traceback=True)
-        self.server.allow_reuse_address = True
+            # Init EPC client port.
+            init_epc_client(int(emacs_server_port))
 
-        # import logging
-        # self.server = ThreadingEPCServer(('127.0.0.1', 0))
-        # self.server.logger.setLevel(logging.DEBUG)
+            # Build EPC server.
+            self.server = ThreadingEPCServer(('127.0.0.1', 0), log_traceback=True)
+            self.server.allow_reuse_address = True
+
+            self.server.register_instance(self) # register instance functions let elisp side call
+
+            # Start EPC server with sub-thread, avoid block Qt main loop.
+            self.server_thread = threading.Thread(target=self.server.serve_forever)
+            self.server_thread.start()
 
         eaf_config_dir = get_emacs_config_dir()
         self.session_file = os.path.join(eaf_config_dir, "session.json")
@@ -77,20 +89,9 @@ class EAF(object):
         if not os.path.exists(eaf_config_dir):
             os.makedirs(eaf_config_dir)
 
-        # ch = logging.FileHandler(filename=os.path.join(eaf_config_dir, 'epc_log.txt'), mode='w')
-        # formatter = logging.Formatter('%(asctime)s | %(levelname)-8s | %(lineno)04d | %(message)s')
-        # ch.setFormatter(formatter)
-        # ch.setLevel(logging.DEBUG)
-        # self.server.logger.addHandler(ch)
-
-        self.server.register_instance(self) # register instance functions let elisp side call
-
-        # Start EPC server with sub-thread, avoid block Qt main loop.
-        self.server_thread = threading.Thread(target=self.server.serve_forever)
-        self.server_thread.start()
-
-        # Pass epc port and webengine codec information to Emacs when first start EAF.
-        eval_in_emacs('eaf--first-start', [self.server.server_address[1]])
+        if not embedded:
+            # Pass epc port and webengine codec information to Emacs when first start EAF.
+            eval_in_emacs('eaf--first-start', [self.server.server_address[1]])
 
         # Disable use system proxy, avoid page slow when no network connected.
         QNetworkProxyFactory.setUseSystemConfiguration(False)
@@ -106,6 +107,13 @@ class EAF(object):
 
         if proxy_type != "" and proxy_host != "" and proxy_port != "":
             self.enable_proxy()
+
+    def view_identity(self, view_info):
+        if platform.system() == "Darwin":
+            parts = view_info.split(":")
+            if len(parts) >= 2:
+                return "{}:{}".format(parts[0], parts[1])
+        return view_info
 
     def enable_proxy(self):
         global proxy_string
@@ -155,6 +163,11 @@ class EAF(object):
         '''
         self.create_buffer(buffer_id, url, module_path, arguments)
 
+        if self.pending_views_data is not None:
+            pending_views_data = self.pending_views_data
+            self.pending_views_data = None
+            QTimer.singleShot(0, lambda pending_views_data=pending_views_data: self.update_views(pending_views_data))
+
     def create_buffer(self, buffer_id, url, module_path, arguments):
         ''' Create buffer.
         create_buffer can't wrap with @PostGui, because need call by createNewWindow signal of browser.'''
@@ -167,6 +180,8 @@ class EAF(object):
         # Don't cache module in memory,
         # this is very convenient for EAF to load the latest application code in real time without the need for kill EAF process.
         spec = importlib.util.spec_from_file_location("AppBuffer", module_path) # type: ignore
+        if spec is None or spec.loader is None:
+            raise RuntimeError("Unable to load EAF app module: {}".format(module_path))
         module = importlib.util.module_from_spec(spec) # type: ignore
         spec.loader.exec_module(module)
 
@@ -185,7 +200,9 @@ class EAF(object):
 
         # Handle dev tools signal.
         if getattr(app_buffer, "open_devtools_tab", False) and getattr(app_buffer.open_devtools_tab, "connect", False):
-            app_buffer.open_devtools_tab.connect(self.open_devtools_tab)
+            app_buffer.open_devtools_tab.connect(
+                lambda web_page, module_path=module_path: self.open_devtools_tab(web_page, module_path)
+            )
 
         # Add create buffer interface for createWindow signal.
         if app_buffer.base_class_name() == "BrowserBuffer":
@@ -209,15 +226,15 @@ class EAF(object):
     def update_views(self, args):
         ''' Update views.'''
         if args != self.views_data:
-            self.views_data = args
-
             from core.view import View
 
             view_infos = args.split(",")
+            view_keys = list(map(self.view_identity, view_infos)) if view_infos != [''] else []
+            missing_buffer = False
 
             # Do something if buffer's all view hide after update_views operation.
             old_view_buffer_ids = list(set(map(lambda v: v.buffer_id, self.view_dict.values())))
-            new_view_buffer_ids = list(set(map(lambda v: v.split(":")[0], view_infos)))
+            new_view_buffer_ids = list(set(map(lambda v: v.split(":")[0], view_infos))) if view_infos != [''] else []
 
             # Call all_views_hide interface when buffer's all views will hide.
             # We do something in app's buffer interface, such as videoplayer will pause video when all views hide.
@@ -230,26 +247,24 @@ class EAF(object):
 
             # Remove old key from view dict and destroy old view.
             for key in list(self.view_dict):
-                if key not in view_infos:
+                if key not in view_keys:
                     self.destroy_view_later(key)
 
             # NOTE:
             # Create new view and REPARENT view to Emacs window.
             if view_infos != ['']:
-                for view_info in view_infos:
-                    if view_info not in self.view_dict:
-                        (buffer_id, _, _, _, _, _) = view_info.split(":")
-                        try:
-                            view = View(self.buffer_dict[buffer_id], view_info)
-                            self.view_dict[view_info] = view
-                        except KeyError:
-                            # Hide all view, to switch *eaf* buffer.
-                            for key in self.view_dict:
-                                self.view_dict[key].hide()
+                for view_info, view_key in zip(view_infos, view_keys):
+                    (buffer_id, _, _, _, _, _) = view_info.split(":")
+                    if buffer_id not in self.buffer_dict:
+                        missing_buffer = True
+                        self.pending_views_data = args
+                        return
 
-                            eval_in_emacs('eaf--rebuild-buffer', [])
-                            message_to_emacs("Buffer id '{}' not exists".format(buffer_id))
-                            return
+                    if view_key not in self.view_dict:
+                        view = View(self.buffer_dict[buffer_id], view_info)
+                        self.view_dict[view_key] = view
+                    else:
+                        self.view_dict[view_key].update_view_info(view_info)
 
             # Call some_view_show interface when buffer's view switch back.
             # Note, this must call after new view create, otherwise some buffer,
@@ -263,9 +278,16 @@ class EAF(object):
             # Adjust buffer size along with views change.
             # Note: just buffer that option `fit_to_view' is False need to adjust,
             # if buffer option fit_to_view is True, buffer render adjust by view.resizeEvent()
+            pending_destroy_keys = set(self.destroy_view_list)
             for buffer in list(self.buffer_dict.values()):
                 if not buffer.fit_to_view:
-                    buffer_views = list(filter(lambda v: v.buffer_id == buffer.buffer_id, list(self.view_dict.values())))
+                    buffer.emacs_render_width = emacs_width
+                    buffer.emacs_render_height = emacs_height
+                    buffer_views = [
+                        view
+                        for key, view in self.view_dict.items()
+                        if view.buffer_id == buffer.buffer_id and key not in pending_destroy_keys
+                    ]
 
                     # Adjust buffer size to max view's size.
                     if len(buffer_views) > 0:
@@ -278,8 +300,8 @@ class EAF(object):
                         buffer.buffer_widget.width, buffer.buffer_widget.height = lambda: emacs_width, lambda: emacs_height
                         buffer.buffer_widget.resize(emacs_width, emacs_height)
 
-                    # Send resize signal to buffer.
-                    buffer.resize_view()
+                    # Avoid sync Emacs queries from the Qt/AppKit thread on macOS.
+                    buffer.resize_view(buffer.buffer_widget.width(), buffer.buffer_widget.height())
 
             # NOTE:
             # When you do switch buffer or kill buffer in Emacs, will call Python function 'update_views.
@@ -289,22 +311,21 @@ class EAF(object):
             # Then screen won't flick.
             self.destroy_view_now()
 
+            if not missing_buffer:
+                self.views_data = args
+
     def destroy_view_later(self, key):
         '''Just record view id in global list 'destroy_view_list', and not destroy old view immediately.'''
-        global destroy_view_list
-
-        destroy_view_list.append(key)
+        self.destroy_view_list.append(key)
 
     def destroy_view_now(self):
         '''Destroy all old view immediately.'''
-        global destroy_view_list
-
-        for key in destroy_view_list:
+        for key in self.destroy_view_list:
             if key in self.view_dict:
                 self.view_dict[key].destroy_view()
             self.view_dict.pop(key, None)
 
-        destroy_view_list = []
+        self.destroy_view_list = []
 
     def button_press_on_eaf_window(self):
         for key in self.buffer_dict:
@@ -354,6 +375,133 @@ class EAF(object):
                 view.screen_shot().save(image_path)
                 message_to_emacs("Save screenshot at: {}".format(image_path))
                 return
+
+    def _ordered_buffer_view_keys(self, buffer_id):
+        ordered_keys = []
+
+        if self.views_data:
+            for view_info in self.views_data.split(","):
+                if not view_info:
+                    continue
+                if view_info.split(":")[0] != buffer_id:
+                    continue
+                view_key = self.view_identity(view_info)
+                if view_key in self.view_dict and view_key not in ordered_keys:
+                    ordered_keys.append(view_key)
+
+        for key, view in self.view_dict.items():
+            if view.buffer_id == buffer_id and key not in ordered_keys:
+                ordered_keys.append(key)
+
+        return ordered_keys
+
+    def _pixmap_looks_placeholder(self, pixmap):
+        if pixmap.isNull():
+            return True
+
+        image = pixmap.toImage()
+        width = image.width()
+        height = image.height()
+        if width <= 0 or height <= 0:
+            return True
+
+        samples = []
+        x_steps = max(2, min(5, width))
+        y_steps = max(2, min(5, height))
+        for y_index in range(y_steps):
+            y = min(height - 1, int((height - 1) * y_index / max(1, y_steps - 1)))
+            for x_index in range(x_steps):
+                x = min(width - 1, int((width - 1) * x_index / max(1, x_steps - 1)))
+                color = image.pixelColor(x, y)
+                samples.append((color.red(), color.green(), color.blue()))
+
+        if not samples:
+            return True
+
+        channel_spread = max(
+            max(sample[channel] for sample in samples) - min(sample[channel] for sample in samples)
+            for channel in range(3)
+        )
+        avg = [sum(sample[channel] for sample in samples) / len(samples) for channel in range(3)]
+        grayish = max(abs(avg[0] - avg[1]), abs(avg[1] - avg[2]), abs(avg[0] - avg[2])) < 6
+        bright = sum(avg) / 3 > 220
+
+        return channel_spread < 8 and grayish and bright
+
+    def save_buffer_views_screenshots_sync(self, buffer_id, output_dir, shot_names):
+        return self._save_buffer_views_screenshots(buffer_id, output_dir, shot_names)
+
+    @PostGui()
+    def _save_buffer_views_screenshots(self, buffer_id, output_dir, shot_names):
+        os.makedirs(output_dir, exist_ok=True)
+        names = [name for name in shot_names.split(",") if name]
+        ordered_keys = self._ordered_buffer_view_keys(buffer_id)
+        saved = 0
+
+        key_index = 0
+        for shot_name in names:
+            view_key = None
+            pixmap = None
+            while key_index < len(ordered_keys):
+                candidate_key = ordered_keys[key_index]
+                key_index += 1
+                view = self.view_dict.get(candidate_key)
+                if view is None:
+                    continue
+                candidate_pixmap = view.screen_shot()
+                if self._pixmap_looks_placeholder(candidate_pixmap) and key_index < len(ordered_keys):
+                    continue
+                view_key = candidate_key
+                pixmap = candidate_pixmap
+                break
+
+            if view_key is None or pixmap is None:
+                continue
+
+            image_path = os.path.join(output_dir, shot_name + ".png")
+            pixmap.save(image_path)
+            saved += 1
+
+        return saved
+
+    def probe_buffer_views_screenshots_sync(self, buffer_id, output_dir, shot_names):
+        return self._probe_buffer_views_screenshots(buffer_id, output_dir, shot_names)
+
+    @PostGui()
+    def _probe_buffer_views_screenshots(self, buffer_id, output_dir, shot_names):
+        os.makedirs(output_dir, exist_ok=True)
+        names = [name for name in shot_names.split(",") if name]
+        ordered_keys = self._ordered_buffer_view_keys(buffer_id)
+        statuses = []
+
+        key_index = 0
+        for shot_name in names:
+            view_key = None
+            pixmap = None
+            ready = False
+            while key_index < len(ordered_keys):
+                candidate_key = ordered_keys[key_index]
+                key_index += 1
+                view = self.view_dict.get(candidate_key)
+                if view is None:
+                    continue
+                candidate_pixmap = view.screen_shot()
+                ready = not self._pixmap_looks_placeholder(candidate_pixmap)
+                if (not ready) and key_index < len(ordered_keys):
+                    continue
+                view_key = candidate_key
+                pixmap = candidate_pixmap
+                break
+
+            if view_key is None or pixmap is None:
+                statuses.append("0")
+                continue
+
+            image_path = os.path.join(output_dir, shot_name + ".png")
+            pixmap.save(image_path)
+            statuses.append("1" if ready else "0")
+
+        return ",".join(statuses)
 
     @PostGui()
     def ocr_buffer(self, buffer_id):
@@ -425,6 +573,69 @@ class EAF(object):
 
         setattr(self, name, _do)
 
+    def _serialize_embedded_sync_result(self, value):
+        """Serialize a Python result so Emacs can rebuild it safely."""
+        if value is None:
+            return ("nil", "")
+
+        if isinstance(value, bool):
+            return ("bool", "t" if value else "nil")
+
+        if isinstance(value, int):
+            return ("int", str(value))
+
+        text = value if isinstance(value, str) else str(value)
+        payload = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        return ("string", payload)
+
+    def _report_embedded_sync_result(self, token, value):
+        kind, payload = self._serialize_embedded_sync_result(value)
+        eval_in_emacs("eaf--macos-store-sync-result", [token, kind, payload])
+
+    def dispatch_buffer_return_call(self, token, method_name, *args):
+        """Run a return-producing buffer call on the Qt/AppKit thread."""
+        self._dispatch_buffer_return_call(token, method_name, *args)
+        return token
+
+    @PostGui()
+    def _dispatch_buffer_return_call(self, token, method_name, *args):
+        try:
+            result = getattr(self, method_name)(*args)
+            self._report_embedded_sync_result(token, result)
+        except Exception:
+            import traceback
+
+            traceback_text = traceback.format_exc()
+            traceback.print_exc()
+            error_payload = base64.b64encode(traceback_text.encode("utf-8")).decode("ascii")
+            eval_in_emacs("eaf--macos-store-sync-result", [token, "error", error_payload])
+
+    def bridge_test_echo(self, value):
+        """Return VALUE directly for Emacs→Python sync bridge testing."""
+        return value
+
+    def bridge_test_mark_async(self, value):
+        """Record VALUE on the Python side for Emacs→Python async testing."""
+        self._bridge_test_last_async = value
+
+    def bridge_test_get_async_mark(self):
+        """Return the last Python-side async marker."""
+        return getattr(self, "_bridge_test_last_async", "")
+
+    def bridge_test_roundtrip_sync(self, value):
+        """Round-trip VALUE through Python→Emacs sync bridge and return it."""
+        return get_emacs_func_result("eaf--bridge-test-echo", [value])
+
+    def bridge_test_async_to_emacs(self, value):
+        """Send VALUE to Emacs through the Python→Emacs async bridge."""
+        eval_in_emacs("eaf--bridge-test-record-async", [value])
+
+    def bridge_test_process_events(self):
+        """Flush a Qt event-loop turn for bridge smoke tests."""
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents()
+
     @PostGui()
     def eval_function(self, buffer_id, function_name, event_string):
         ''' Execute function and do not return anything. '''
@@ -479,10 +690,13 @@ class EAF(object):
         for key in list(self.view_dict):
             self.view_dict[key].try_hide_top_view()
 
-    def open_devtools_tab(self, web_page):
+    def open_devtools_tab(self, web_page, module_path=None):
         ''' Open devtools tab'''
         self.devtools_page = web_page
-        eval_in_emacs('eaf-open-devtool-page', [])
+        if module_path:
+            eval_in_emacs('eaf-open-devtool-page', [module_path])
+        else:
+            eval_in_emacs('eaf-open-devtool-page', [])
 
         # We need adjust web window size after open developer tool.
         QTimer().singleShot(1000, lambda : eval_in_emacs('eaf-monitor-configuration-change', []))
@@ -597,15 +811,209 @@ class OCRThread(QThread):
         import os
         os.remove(self.image_path)
 
+def eaf_ensure_qapp() -> None:
+    """Create QApplication if one does not exist yet.
+
+    Must be called from the Cocoa main thread (i.e. the Emacs main thread).
+    The QtWebEngineWidgets import at the top of this module already satisfies
+    the 'must be imported before QApplication' requirement.
+    """
+    import sys
+    app = QApplication.instance()
+    if app is None:
+        hardware_acceleration_args = [
+            "--ignore-gpu-blocklist",
+            "--enable-gpu-rasterization",
+            "--enable-native-gpu-memory-buffers",
+        ]
+        app = QApplication(sys.argv + hardware_acceleration_args)
+        app.setApplicationName("eaf.py")
+
+
+def eaf_start_embedded_thread(width: int, height: int) -> None:
+    """Start EAF initialisation on a Python daemon thread (no EPC port needed).
+
+    Called by the macOS dynamic module after QApplication has been created on
+    the main thread.  Using Python's threading.Thread (not GCD) ensures correct
+    GIL cooperation and avoids threading.Lock ordering issues with PyQt.
+
+    EAF.__init__ makes bridge sync calls back to Emacs; running it on a
+    background thread keeps Emacs responsive while Emacs services the bridge
+    from its normal command loop.
+    After init, _eaf_embedded_instance is set and Emacs is notified via the
+    bridge so it can open any pending buffers (eaf--first-start-embedded).
+    """
+    def _run():
+        global _eaf_embedded_instance
+        import _eaf_bridge
+        inst = EAF([str(width), str(height), "0"], embedded=True)
+
+        # Pre-cache all values that eaf-macos-call-python will need on the
+        # main thread (AppBuffer.__init__ theme calls, feature flags).
+        # Must be done here on the background thread so bridge sync calls work.
+        from core.utils import get_emacs_config_dir, get_emacs_func_cache_result, get_emacs_vars
+        get_emacs_func_cache_result("eaf-get-theme-mode", [])
+        get_emacs_func_cache_result("eaf-get-theme-background-color", [])
+        get_emacs_func_cache_result("eaf-get-theme-foreground-color", [])
+        is_mac_port = bool(get_emacs_func_cache_result("eaf--mac-port-p", []))
+        get_emacs_func_cache_result("eaf-emacs-running-in-wayland-native", [])
+        get_emacs_func_cache_result("eaf-emacs-not-use-reparent-technology", [])
+        get_emacs_func_cache_result("eaf-get-mode-line-height", [])
+
+        # Browser/App init on mac-port cannot safely block the AppKit/Lisp
+        # threads on arbitrary sync bridge lookups, so keep the broad prewarm
+        # here and avoid lazy bridge misses during first app startup.
+        if is_mac_port:
+            get_emacs_vars([
+                "eaf-config-location",
+                "eaf-webengine-pc-user-agent",
+                "eaf-webengine-phone-user-agent",
+                "eaf-webengine-font-family",
+                "eaf-webengine-fixed-font-family",
+                "eaf-webengine-serif-font-family",
+                "eaf-webengine-font-size",
+                "eaf-webengine-fixed-font-size",
+                "eaf-webengine-enable-plugin",
+                "eaf-webengine-enable-javascript",
+                "eaf-webengine-enable-javascript-access-clipboard",
+                "eaf-webengine-enable-scrollbar",
+                "eaf-webengine-unknown-url-scheme-policy",
+                "eaf-webengine-download-path",
+                "eaf-webengine-default-zoom",
+                "eaf-webengine-zoom-step",
+                "eaf-webengine-show-hover-link",
+                "eaf-marker-letters",
+                "eaf-marker-fontsize",
+                "eaf-webengine-scroll-step",
+                "eaf-browser-dark-mode",
+                "eaf-browser-remember-history",
+                "eaf-browser-blank-page-url",
+                "eaf-browser-enable-adblocker",
+                "eaf-browser-enable-autofill",
+                "eaf-browser-enable-tampermonkey",
+                "eaf-browser-tampermonkey-location",
+                "eaf-browser-aria2-auto-file-renaming",
+                "eaf-browser-aria2-proxy-host",
+                "eaf-browser-aria2-proxy-port",
+                "eaf-browser-chrome-history-file",
+                "eaf-browser-safari-history-file",
+                "eaf-browser-translate-language",
+                "eaf-browser-text-selection-color",
+                "eaf-browser-dark-mode-theme",
+                "eaf-browser-auto-import-chrome-cookies",
+                "eaf-browser-chrome-browser-name",
+                "eaf-browser-ignore-history-list",
+                "eaf-browser-progress-bar-height",
+                "eaf-browser-progress-bar-color",
+                "eaf-browser-reader-mode-style",
+            ])
+            get_emacs_vars([
+                "eaf-buffer-background-color",
+                "user-full-name",
+                "eaf-file-manager-show-hidden-file",
+                "eaf-file-manager-show-preview",
+                "eaf-file-manager-show-icon",
+                "eaf-markdown-dark-mode",
+                "eaf-org-text-selection-color",
+                "eaf-org-dark-mode",
+                "eaf-git-layout",
+                "eaf-git-status-initial-state",
+                "eaf-git-untracked-initial-state",
+                "eaf-git-unstaged-initial-state",
+                "eaf-git-staged-initial-state",
+                "eaf-git-stash-initial-state",
+                "eaf-git-unpushed-initial-state",
+                "eaf-git-dark-highlight-style",
+                "eaf-git-light-highlight-style",
+                "eaf-git-js-keybinding",
+                "eaf-pyqterminal-font-size",
+                "eaf-pyqterminal-font-family",
+                "eaf-pyqterminal-refresh-ms",
+                "eaf-pyqterminal-cursor-type",
+                "eaf-pyqterminal-cursor-size",
+                "eaf-pyqterminal-cursor-alpha",
+                "eaf-pyqterminal-device-pixel-ratio",
+                "eaf-terminal-font-size",
+                "eaf-terminal-font-family",
+                "eaf-terminal-dark-mode",
+                "eaf-jupyter-font-size",
+                "eaf-jupyter-font-family",
+                "eaf-jupyter-dark-mode",
+                "eaf-mindmap-edit-mode",
+                "eaf-mindmap-save-path",
+                "eaf-mindmap-dark-mode",
+                "eaf-music-play-order",
+                "eaf-music-player-buffer",
+                "eaf-music-cache-dir",
+                "eaf-rss-reader-refresh-time",
+                "eaf-pdf-store-history",
+                "eaf-pdf-dark-mode",
+                "eaf-pdf-dark-exclude-image",
+                "eaf-pdf-default-zoom",
+                "eaf-pdf-zoom-step",
+                "eaf-pdf-scroll-ratio",
+                "eaf-pdf-text-highlight-annot-color",
+                "eaf-pdf-text-underline-annot-color",
+                "eaf-pdf-inline-text-annot-color",
+                "eaf-pdf-inline-text-annot-fontsize",
+                "eaf-pdf-show-progress-on-page",
+                "eaf-pdf-click-to-copy",
+                "eaf-pdf-notify-file-changed",
+                "eaf-pdf-marker-fontsize",
+            ])
+            get_emacs_func_cache_result(
+                "get-emacs-face-foregrounds",
+                [
+                    "font-lock-builtin-face",
+                    "font-lock-keyword-face",
+                    "font-lock-function-name-face",
+                    "error",
+                    "font-lock-string-face",
+                    "warning",
+                ],
+            )
+            get_emacs_func_cache_result(
+                "get-emacs-face-foregrounds",
+                [
+                    "default",
+                    "font-lock-function-name-face",
+                    "font-lock-keyword-face",
+                    "font-lock-builtin-face",
+                    "font-lock-comment-face",
+                    "font-lock-string-face",
+                    "font-lock-negation-char-face",
+                ],
+            )
+            get_emacs_func_cache_result(
+                "get-emacs-face-foregrounds",
+                [
+                    "default",
+                    "font-lock-function-name-face",
+                    "font-lock-keyword-face",
+                    "font-lock-builtin-face",
+                    "font-lock-comment-face",
+                    "font-lock-string-face",
+                    "font-lock-negation-char-face",
+                    "font-lock-variable-name-face",
+                    "font-lock-type-face",
+                    "font-lock-warning-face",
+                ],
+            )
+            get_emacs_func_cache_result("eaf-mind-elixir-get-rainbow-colors", [])
+            get_emacs_func_cache_result("eaf-pyqterminal-get-color-schema", [])
+            get_emacs_config_dir()
+
+        # Set instance BEFORE notifying Emacs so eaf-macos-call-python can find it.
+        _eaf_embedded_instance = inst
+        _eaf_bridge.eval_async("(eaf--first-start-embedded)")
+
+    t = threading.Thread(target=_run, daemon=True, name="eaf-embedded-init")
+    t.start()
+
+
 if __name__ == "__main__":
     import sys
     import signal
-
-    proxy_string = ""
-
-    emacs_width = emacs_height = 0
-
-    destroy_view_list = []
 
     hardware_acceleration_args = []
     if platform.system() != "Windows":

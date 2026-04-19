@@ -9,5 +9,6 @@ tags
 /.eaf-installed-apps.json
 compile_commands.json
 /reinput/reinput
+/core/macos/eaf-macos-module.so
 .cache/
 .aider*
