@@ -339,6 +339,41 @@ class EAF(object):
 
         self.destroy_view_list = []
 
+    def _flush_shutdown_events(self):
+        app = QApplication.instance()
+        if app is None:
+            return
+
+        from PyQt6.QtCore import QCoreApplication
+
+        for _ in range(3):
+            QCoreApplication.sendPostedEvents(None, 0)
+            app.processEvents()
+
+    def _kill_buffer_impl(self, buffer_id):
+        '''Kill all views for BUFFER_ID and remove the backing buffer.'''
+        for key in list(self.view_dict):
+            if buffer_id == self.view_dict[key].buffer_id:
+                self.destroy_view_later(key)
+
+        if buffer_id in self.buffer_dict:
+            self.save_buffer_session(self.buffer_dict[buffer_id])
+            self.buffer_dict[buffer_id].destroy_buffer()
+            self.buffer_dict.pop(buffer_id, None)
+
+    def _shutdown_from_emacs_impl(self):
+        '''Synchronously tear down Python-side EAF state before Emacs exits.'''
+        for buffer_id in list(self.buffer_dict):
+            self._kill_buffer_impl(buffer_id)
+
+        # kill_emacs has no later update_views pass to drain deferred view
+        # destruction, so flush it explicitly before the host app exits.
+        self.destroy_view_now()
+        self._flush_shutdown_events()
+        self.cleanup()
+
+        return True
+
     def button_press_on_eaf_window(self):
         for key in self.buffer_dict:
             buffer_widget = self.buffer_dict[key].buffer_widget
@@ -351,18 +386,7 @@ class EAF(object):
     @PostGui()
     def kill_buffer(self, buffer_id):
         ''' Kill all view based on buffer_id and clean buffer from buffer dict.'''
-        # Kill all view base on buffer_id.
-        for key in list(self.view_dict):
-            if buffer_id == self.view_dict[key].buffer_id:
-                self.destroy_view_later(key)
-
-        # Clean buffer from buffer dict.
-        if buffer_id in self.buffer_dict:
-            # Save buffer session.
-            self.save_buffer_session(self.buffer_dict[buffer_id])
-
-            self.buffer_dict[buffer_id].destroy_buffer()
-            self.buffer_dict.pop(buffer_id, None)
+        self._kill_buffer_impl(buffer_id)
 
     @PostGui()
     def clip_buffer(self, buffer_id):
@@ -421,12 +445,11 @@ class EAF(object):
     @PostGui()
     def kill_emacs(self):
         ''' Kill all buffurs from buffer dict.'''
-        tmp_buffer_dict = {}
-        for buffer_id in self.buffer_dict:
-            tmp_buffer_dict[buffer_id] = self.buffer_dict[buffer_id]
+        self._shutdown_from_emacs_impl()
 
-        for buffer_id in tmp_buffer_dict:
-            self.kill_buffer(buffer_id)
+    def shutdown_from_emacs(self):
+        '''Run a synchronous shutdown path for embedded macOS Emacs exit.'''
+        return self._shutdown_from_emacs_impl()
 
     def build_buffer_function(self, name):
         @PostGui()

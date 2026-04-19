@@ -1690,7 +1690,19 @@ Such as Wayland native."
              (when (equal eaf--buffer-app-name "browser")
                (setq browser-urls (concat eaf--buffer-url "\n" browser-urls)))))
          nil browser-restore-file-path)))
-    (eaf-call-async "kill_emacs")))
+    (if (eaf--macos-embedded-p)
+        (progn
+          ;; On ns-port, a plain async `kill_emacs' can still be queued on the
+          ;; Qt/AppKit thread while Emacs tears down AppKit state.  Shut EAF
+          ;; down synchronously first, then detach all native host views before
+          ;; `ns_term_shutdown' runs.
+          (ignore-errors
+            (eaf--macos-call-sync-via-bridge "shutdown_from_emacs"))
+          (when (fboundp 'eaf-macos-shutdown)
+            (ignore-errors
+              (eaf-macos-shutdown)))
+          (eaf--disable-macos-bridge-service))
+      (eaf-call-async "kill_emacs"))))
 
 (defun eaf-keyboard-quit ()
   "Wrap around `keyboard-quit' and signals a ‘quit’ condition to EAF applications."

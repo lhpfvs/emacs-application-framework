@@ -28,6 +28,7 @@ int plugin_is_GPL_compatible;
 static BOOL gPythonStarted    = NO;
 static BOOL gEAFStarted       = NO;
 static BOOL gEAFStartInProgress = NO;
+static BOOL gEmacsShuttingDown = NO;
 static PyObject *gEAFModule   = NULL;  // 'eaf' Python module (borrowed ref kept alive)
 
 static void eaf_python_add_paths(const char *source_dir, const char *venv_site) {
@@ -699,6 +700,16 @@ static inline void runOnAppKitAsync(dispatch_block_t block) {
     dispatch_async(dispatch_get_main_queue(), block);
 }
 
+static inline void withDirectBridgeEnv(emacs_env *env, dispatch_block_t block) {
+    emacs_env *prevDirectEnv = gDirectBridgeEnv;
+    gDirectBridgeEnv = env;
+    @try {
+        block();
+    } @finally {
+        gDirectBridgeEnv = prevDirectEnv;
+    }
+}
+
 static NSWindow *windowForWindowNumber(NSInteger windowNumber) {
     if (windowNumber > 0) {
         NSWindow *window = [NSApp windowWithWindowNumber:windowNumber];
@@ -928,6 +939,10 @@ static NSView *findFocusableEmacsView(NSView *root, NSWindow *window) {
 }
 
 static void activateEmacsWindowForBufferId(NSString *bufferId) {
+    if (gEmacsShuttingDown) {
+        return;
+    }
+
     runOnMainSync(^{
         NSWindow *window = windowForBufferId(bufferId);
         if (!window) {
@@ -969,6 +984,22 @@ static void releaseViewState(EAFViewState *state) {
     state.containerView = nil;
     state.hostView = nil;
     state.hostWindow = nil;
+}
+
+static void releaseAllViewStates(void) {
+    NSMutableDictionary *viewRegistry = gRegistry;
+    if (!viewRegistry || viewRegistry.count == 0) {
+        gRegistry = nil;
+        return;
+    }
+
+    NSArray<EAFViewState *> *states = [viewRegistry allValues];
+    [viewRegistry removeAllObjects];
+    gRegistry = nil;
+
+    for (EAFViewState *state in states) {
+        releaseViewState(state);
+    }
 }
 
 static EAFViewState *ensureViewState(NSString *bufferId,
@@ -1043,6 +1074,7 @@ static EAFViewState *ensureViewState(NSString *bufferId,
 static emacs_value
 Fupdate_views(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void *data) {
     if (nargs != 1) return env->intern(env, "nil");
+    if (gEmacsShuttingDown) return env->intern(env, "nil");
 
     NSString *viewSpecs = extractNSString(env, args[0]);
     runOnAppKitAsync(^{
@@ -1105,15 +1137,22 @@ Fupdate_views(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void *data) {
                                         @(localH)]];
         }
 
-        eaf_python_update_views([pythonViewInfos componentsJoinedByString:@","]);
+        // update_views/native_resize_view can still hit bridge sync queries on
+        // the Qt/AppKit thread (for example, a cache miss during View setup).
+        // Service those inline while this Emacs call is active so the main
+        // thread does not enqueue a sync bridge item and then deadlock waiting
+        // for itself to drain the queue later.
+        withDirectBridgeEnv(env, ^{
+            eaf_python_update_views([pythonViewInfos componentsJoinedByString:@","]);
 
-        for (NSArray *resizeInfo in pendingResizes) {
-            NSString *bufferId = resizeInfo[0];
-            uintptr_t hostWid = (uintptr_t)[resizeInfo[1] unsignedLongLongValue];
-            int width = [resizeInfo[2] intValue];
-            int height = [resizeInfo[3] intValue];
-            eaf_python_resize_view(bufferId, hostWid, width, height);
-        }
+            for (NSArray *resizeInfo in pendingResizes) {
+                NSString *bufferId = resizeInfo[0];
+                uintptr_t hostWid = (uintptr_t)[resizeInfo[1] unsignedLongLongValue];
+                int width = [resizeInfo[2] intValue];
+                int height = [resizeInfo[3] intValue];
+                eaf_python_resize_view(bufferId, hostWid, width, height);
+            }
+        });
 
         NSMutableArray<NSString *> *staleViewIds = [NSMutableArray array];
         for (NSString *viewId in viewRegistry) {
@@ -1140,6 +1179,7 @@ Fupdate_views(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void *data) {
 static emacs_value
 Fdestroy_buffer_views(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void *data) {
     if (nargs != 1) return env->intern(env, "nil");
+    if (gEmacsShuttingDown) return env->intern(env, "nil");
     NSString *bufferId = extractNSString(env, args[0]);
     NSArray<NSString *> *keys = registryKeysForBufferId(bufferId);
     if (keys.count > 0) {
@@ -1163,11 +1203,29 @@ Fdestroy_buffer_views(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void 
 /// (eaf-macos-activate-emacs-window [BUFFER-ID]) → nil
 static emacs_value
 Factivate_emacs_window(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void *data) {
+    if (gEmacsShuttingDown) {
+        return env->intern(env, "nil");
+    }
+
     NSString *bufferId = nil;
     if (nargs == 1) {
         bufferId = extractNSString(env, args[0]);
     }
     activateEmacsWindowForBufferId(bufferId);
+    return env->intern(env, "nil");
+}
+
+/// (eaf-macos-shutdown) → nil
+/// Detach all native host views before Emacs tears down AppKit state.
+static emacs_value
+Fshutdown(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void *data) {
+    gEmacsShuttingDown = YES;
+    gDirectBridgeEnv = NULL;
+
+    runOnMainSync(^{
+        releaseAllViewStates();
+    });
+
     return env->intern(env, "nil");
 }
 
@@ -1217,6 +1275,9 @@ int emacs_module_init(struct emacs_runtime *ert) {
     bindFunction(env, "eaf-macos-activate-emacs-window", 0, 1, Factivate_emacs_window,
                  "Activate the current Emacs NSWindow and restore keyboard focus.\n"
                  "When BUFFER-ID is provided, prefer the NSWindow hosting that EAF view.");
+
+    bindFunction(env, "eaf-macos-shutdown", 0, 0, Fshutdown,
+                 "Detach native EAF host views before Emacs exits.");
 
     emacs_value provide  = env->intern(env, "provide");
     emacs_value feature  = env->intern(env, "eaf-macos-module");
