@@ -325,6 +325,8 @@ def _embedded_emacs_notify(method_name, raw_args, sexp):
                 buffer_id = str(raw_args[0])
                 _eaf_bridge.focus_buffer(buffer_id)
                 _eaf_bridge.activate_emacs_window(buffer_id)
+            else:
+                _eaf_bridge.activate_emacs_window()
             return None
         if len(raw_args) == 0:
             _eaf_bridge.activate_emacs_window()

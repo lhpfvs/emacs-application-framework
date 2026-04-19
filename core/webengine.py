@@ -271,7 +271,7 @@ Note, we need hook this function to signal 'loadProgress', signal 'loadStarted' 
         if event.type() == QEvent.Type.MouseButtonPress:
 
             if platform.system() == "Darwin":
-                eval_in_emacs('eaf-activate-emacs-window', [])
+                eval_in_emacs('eaf-activate-emacs-window', [self.buffer_id])
 
             if event.button() == Qt.MouseButton.ForwardButton:
                 modifiers = QApplication.keyboardModifiers()
