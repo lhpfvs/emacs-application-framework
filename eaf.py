@@ -347,8 +347,42 @@ class EAF(object):
         from PyQt6.QtCore import QCoreApplication
 
         for _ in range(3):
+            # On ns-port the Cocoa/Emacs main loop already owns the AppKit
+            # autorelease pools. Re-entering the full Qt event loop here via
+            # processEvents() can trip AppKit pool balancing during kill-emacs.
+            # sendPostedEvents() is enough to drain deleteLater/posted cleanup
+            # work without spinning a nested NSApplication event loop.
             QCoreApplication.sendPostedEvents(None, 0)
-            app.processEvents()
+
+    def _prepare_shared_shutdown(self):
+        import sys
+
+        webengine = sys.modules.get("core.webengine")
+        if webengine is not None and hasattr(webengine, "prepare_webengine_shutdown"):
+            webengine.prepare_webengine_shutdown()
+
+    def _shutdown_shared_qt_resources(self):
+        import sys
+
+        webengine = sys.modules.get("core.webengine")
+        if webengine is not None and hasattr(webengine, "shutdown_shared_webengine"):
+            webengine.shutdown_shared_webengine()
+
+    def _shutdown_qt_application(self):
+        app = QApplication.instance()
+        if app is None:
+            return
+
+        from PyQt6 import sip
+        import __main__
+
+        try:
+            if hasattr(__main__, "_eaf_qapp"):
+                __main__._eaf_qapp = None
+            if not sip.isdeleted(app):
+                sip.delete(app)
+        except RuntimeError:
+            pass
 
     def _kill_buffer_impl(self, buffer_id):
         '''Kill all views for BUFFER_ID and remove the backing buffer.'''
@@ -363,6 +397,10 @@ class EAF(object):
 
     def _shutdown_from_emacs_impl(self):
         '''Synchronously tear down Python-side EAF state before Emacs exits.'''
+        global _eaf_embedded_instance
+
+        self._prepare_shared_shutdown()
+
         for buffer_id in list(self.buffer_dict):
             self._kill_buffer_impl(buffer_id)
 
@@ -370,7 +408,17 @@ class EAF(object):
         # destruction, so flush it explicitly before the host app exits.
         self.destroy_view_now()
         self._flush_shutdown_events()
+        self._shutdown_shared_qt_resources()
+        self._flush_shutdown_events()
+        self._shutdown_qt_application()
         self.cleanup()
+
+        if _eaf_embedded_instance is self:
+            _eaf_embedded_instance = None
+        import gc
+
+        gc.collect()
+        self._flush_shutdown_events()
 
         return True
 

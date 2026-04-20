@@ -264,6 +264,9 @@ class Buffer(QGraphicsScene):
 
     def change_title(self, new_title):
         ''' Change title.'''
+        if getattr(self, "_destroying", False):
+            return
+
         if new_title != "about:blank":
             self.title = new_title
             eval_in_emacs('eaf--update-buffer-details', [self.buffer_id, new_title, self.url])

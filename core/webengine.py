@@ -32,12 +32,96 @@ from urllib.parse import parse_qs, urlparse
 
 from core.buffer import Buffer
 from core.utils import *
-from PyQt6 import QtCore
+from PyQt6 import QtCore, sip
 from PyQt6.QtCore import QEvent, QEventLoop, QPoint, QPointF, Qt, QThread, QTimer, QUrl, pyqtSlot
 from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineSettings
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import QApplication, QWidget
+
+webengine_profile = None
+_webengine_message_handler_installed = False
+_webengine_shutting_down = False
+
+
+def _filter_instant_message(*args):
+    if not args[-1].endswith('value updates in HTML will be broken!'):
+        print("".join(list(map(str, args[2:]))))
+
+
+def get_webengine_profile():
+    global webengine_profile
+
+    if webengine_profile is None:
+        webengine_profile = QWebEngineProfile('eaf')
+        webengine_profile.setPersistentCookiesPolicy(
+            QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies
+        )
+        webengine_profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
+
+    return webengine_profile
+
+
+def install_webengine_message_handler():
+    global _webengine_message_handler_installed
+
+    if not _webengine_message_handler_installed:
+        QtCore.qInstallMessageHandler(_filter_instant_message)
+        _webengine_message_handler_installed = True
+
+
+def prepare_webengine_shutdown():
+    global _webengine_shutting_down
+
+    _webengine_shutting_down = True
+
+
+def shutdown_shared_webengine():
+    global webengine_profile
+    global _webengine_message_handler_installed
+
+    prepare_webengine_shutdown()
+
+    if _webengine_message_handler_installed:
+        try:
+            QtCore.qInstallMessageHandler(None)
+        except TypeError:
+            pass
+        _webengine_message_handler_installed = False
+
+    if webengine_profile is not None:
+        _delete_qt_object(webengine_profile)
+        webengine_profile = None
+
+
+def _delete_qt_object(obj):
+    if obj is None:
+        return
+
+    try:
+        if sip.isdeleted(obj):
+            return
+    except Exception:
+        return
+
+    try:
+        if _webengine_shutting_down:
+            sip.delete(obj)
+        else:
+            obj.deleteLater()
+    except RuntimeError:
+        pass
+
+
+def _disconnect_signal(signal):
+    if signal is None:
+        return
+
+    try:
+        signal.disconnect()
+    except (RuntimeError, TypeError):
+        pass
+
 
 class BrowserView(QWebEngineView):
 
@@ -835,10 +919,6 @@ class BrowserPage(QWebEnginePage):
         if self.url().toString() == "file:///":
             print("[JavaScript console]: " + message)
 
-webengine_profile = QWebEngineProfile('eaf')
-webengine_profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
-webengine_profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
-
 class BrowserBuffer(Buffer):
 
     close_page = QtCore.pyqtSignal(str)
@@ -847,12 +927,14 @@ class BrowserBuffer(Buffer):
     def __init__(self, buffer_id, url, arguments, fit_to_view):
         Buffer.__init__(self, buffer_id, url, arguments, fit_to_view)
 
-        self.profile = webengine_profile
+        self.profile = get_webengine_profile()
+        install_webengine_message_handler()
 
         self.add_widget(BrowserView(self.profile, buffer_id))
         self._set_page_lifecycle_state(QWebEnginePage.LifecycleState.Active)
 
         self.url = url
+        self._destroying = False
 
         self.config_dir = get_emacs_config_dir()
         self.page_closed = False
@@ -969,7 +1051,6 @@ class BrowserBuffer(Buffer):
         self.buffer_widget.zoom_reset()
 
         # Build webchannel object.
-        QtCore.qInstallMessageHandler(self.filter_instant_message)
         self.channel = QWebChannel()
         self.channel.registerObject("pyobject", self)
         self.buffer_widget.web_page.setWebChannel(self.channel)
@@ -1007,11 +1088,6 @@ class BrowserBuffer(Buffer):
                             self.buffer_widget.execute_js("Array.from(document.getElementsByClassName(\"eaf-marker\")).map(function(e) { return e.id });")))
         except Exception:
             return None
-
-    def filter_instant_message(self, *args):
-        # Disable QWebChannel warnings.
-        if not args[-1].endswith('value updates in HTML will be broken!'):
-            print("".join(list(map(str, args[2:]))))
 
     def permission_requested(self, frame, feature):
         self.buffer_widget.web_page.setFeaturePermission(frame, feature, QWebEnginePage.PermissionPolicy.PermissionGrantedByUser)
@@ -1139,16 +1215,74 @@ class BrowserBuffer(Buffer):
 
     def destroy_buffer(self):
         ''' Destroy the buffer.'''
+        if self.buffer_widget is None:
+            return
+
+        self._destroying = True
+        widget = self.buffer_widget
+        web_page = getattr(widget, "web_page", None)
+
+        try:
+            widget.blockSignals(True)
+        except RuntimeError:
+            pass
+
+        if web_page is not None:
+            try:
+                web_page.blockSignals(True)
+            except RuntimeError:
+                pass
+
+        try:
+            self.profile.downloadRequested.disconnect(self.handle_download_request)
+        except (RuntimeError, TypeError):
+            pass
+
+        for signal_name in (
+            "titleChanged",
+            "urlChanged",
+            "loadStarted",
+            "loadProgress",
+            "loadFinished",
+            "selectionChanged",
+        ):
+            _disconnect_signal(getattr(widget, signal_name, None))
+
+        for signal_name in (
+            "windowCloseRequested",
+            "fullScreenRequested",
+            "pdfPrintingFinished",
+            "featurePermissionRequested",
+            "scrollPositionChanged",
+        ):
+            _disconnect_signal(getattr(web_page, signal_name, None))
+
         # Record close page.
-        self.close_page.emit(self.buffer_widget.get_url())
+        try:
+            self.close_page.emit(widget.get_url())
+        except Exception:
+            pass
 
-        # Load blank page to stop video playing, such as youtube.com.
-        self.buffer_widget.setUrl(QUrl("about:blank"))
+        if widget is not None:
+            if hasattr(widget, "stop"):
+                widget.stop()
 
-        if self.buffer_widget is not None:
+            if getattr(self, "channel", None) is not None:
+                try:
+                    if web_page is not None:
+                        web_page.setWebChannel(None)
+                except Exception:
+                    pass
+
+                _delete_qt_object(self.channel)
+                self.channel = None
+
             # NOTE: We need delete QWebEnginePage manual, otherwise QtWebEngineProcess won't quit.
-            self.buffer_widget.web_page.deleteLater()
-            self.buffer_widget.deleteLater()
+            if web_page is not None:
+                _delete_qt_object(web_page)
+                widget.web_page = None
+            _delete_qt_object(widget)
+            self.buffer_widget = None
 
     def get_key_event_widgets(self):
         ''' Send key event to QWebEngineView's focusProxy widget.'''

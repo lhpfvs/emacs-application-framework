@@ -449,6 +449,17 @@ static BOOL eaf_instance_ready(void) {
     return ready;
 }
 
+static void clear_eaf_module_ref(void) {
+    if (!gPythonStarted || !gEAFModule) {
+        gEAFModule = NULL;
+        return;
+    }
+
+    PyGILState_STATE gil = PyGILState_Ensure();
+    Py_CLEAR(gEAFModule);
+    PyGILState_Release(gil);
+}
+
 static emacs_value python_result_to_emacs(emacs_env *env, PyObject *value) {
     if (!value || value == Py_None) return env->intern(env, "nil");
     if (PyBool_Check(value)) return env->intern(env, PyObject_IsTrue(value) ? "t" : "nil");
@@ -1225,6 +1236,9 @@ Fshutdown(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void *data) {
     runOnMainSync(^{
         releaseAllViewStates();
     });
+    clear_eaf_module_ref();
+    gEAFStarted = NO;
+    gEAFStartInProgress = NO;
 
     return env->intern(env, "nil");
 }
